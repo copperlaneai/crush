@@ -4,6 +4,7 @@ use std::env;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
@@ -662,22 +663,30 @@ fn input_backpressure_does_not_block_pause_or_signal_shutdown() {
         .writer
         .try_clone()
         .expect("duplicate controller for input flood");
-    let (started_tx, started_rx) = mpsc::sync_channel(1);
-    let flood = thread::spawn(move || {
-        let block = [b'x'; 16 * 1024];
-        let _ = started_tx.send(());
-        while flooding_writer.write_all(&block).is_ok() {}
-    });
-    started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("input flood started");
-    thread::sleep(Duration::from_millis(150));
+    set_nonblocking(&flooding_writer);
+    let block = [b'x'; 16 * 1024];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut flooded_bytes = 0_usize;
+    loop {
+        match flooding_writer.write(&block) {
+            Ok(0) => panic!("test PTY accepted a zero-length input write"),
+            Ok(count) => flooded_bytes = flooded_bytes.saturating_add(count),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("flood test PTY input: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "test PTY input did not reach backpressure"
+        );
+    }
+    assert!(flooded_bytes > 0, "test PTY accepted no flood input");
+    drop(flooding_writer);
 
     run.signal(libc::SIGTSTP);
     run.wait_until_stopped_and_resume();
     run.signal(libc::SIGTERM);
     let (status, _) = run.finish();
-    flood.join().expect("join input flood writer");
 
     assert_eq!(status.signal(), Some(libc::SIGTERM), "status={status}");
 }
@@ -870,6 +879,9 @@ impl PtyRun {
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                     // Linux PTY controllers conventionally report EIO after
                     // the final slave descriptor closes; macOS returns EOF.
                     Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
@@ -968,6 +980,26 @@ impl PtyRun {
         let output = self.reader.join().expect("join test PTY reader");
         (status, output)
     }
+}
+
+fn set_nonblocking(file: &File) {
+    let descriptor = file.as_raw_fd();
+    // SAFETY: `descriptor` is owned by `file` and remains live for both calls.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    assert!(
+        flags >= 0,
+        "read test PTY descriptor flags: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `descriptor` is live and `flags | O_NONBLOCK` is a valid status
+    // flag set for F_SETFL.
+    let result = unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    assert_eq!(
+        result,
+        0,
+        "make test PTY descriptor nonblocking: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn wait_for_file(path: &Path) {
