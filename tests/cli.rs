@@ -661,18 +661,28 @@ fn input_backpressure_does_not_block_pause_or_signal_shutdown() {
     run.wait_until_ready();
     let mut flooding_writer = run
         .writer
+        .as_ref()
+        .expect("test PTY writer is open")
         .try_clone()
         .expect("duplicate controller for input flood");
-    let original_flags = set_nonblocking(&flooding_writer);
-    let block = [b'x'; 16 * 1024];
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut first_backpressure = None;
     let mut flooded_bytes = 0_usize;
     loop {
-        match flooding_writer.write(&block) {
+        if !test_pty_is_writable(&flooding_writer) {
+            let now = Instant::now();
+            let backpressure_started = *first_backpressure.get_or_insert(now);
+            if now.saturating_duration_since(backpressure_started) >= Duration::from_millis(150) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        match flooding_writer.write(b"x") {
             Ok(0) => panic!("test PTY accepted a zero-length input write"),
             Ok(count) => flooded_bytes = flooded_bytes.saturating_add(count),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("flood test PTY input: {error}"),
         }
         assert!(
@@ -681,7 +691,6 @@ fn input_backpressure_does_not_block_pause_or_signal_shutdown() {
         );
     }
     assert!(flooded_bytes > 0, "test PTY accepted no flood input");
-    set_status_flags(&flooding_writer, original_flags);
     drop(flooding_writer);
 
     run.signal(libc::SIGTSTP);
@@ -813,9 +822,9 @@ fn terminal_input_fixture() -> Vec<u8> {
 
 struct PtyRun {
     child: Child,
-    writer: File,
+    writer: Option<File>,
     ready: Receiver<()>,
-    reader: JoinHandle<Vec<u8>>,
+    reader: Option<JoinHandle<Vec<u8>>>,
     observed: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -894,9 +903,9 @@ impl PtyRun {
 
         Self {
             child,
-            writer,
+            writer: Some(writer),
             ready,
-            reader,
+            reader: Some(reader),
             observed,
         }
     }
@@ -908,7 +917,11 @@ impl PtyRun {
     }
 
     fn write_input(&mut self, input: &[u8]) {
-        self.writer.write_all(input).expect("write test PTY input");
+        self.writer
+            .as_mut()
+            .expect("test PTY writer is open")
+            .write_all(input)
+            .expect("write test PTY input");
     }
 
     fn signal(&self, signal: libc::c_int) {
@@ -961,52 +974,107 @@ impl PtyRun {
     }
 
     fn wait_for_exit(&mut self, timeout: Duration) -> ExitStatus {
+        if let Some(status) = self.poll_for_exit(timeout).expect("poll Crush test child") {
+            return status;
+        }
+        self.terminate_boundedly();
+        panic!("Crush test child timed out");
+    }
+
+    fn poll_for_exit(&mut self, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(status) = self.child.try_wait().expect("poll Crush test child") {
-                return status;
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(Some(status));
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!("Crush test child timed out");
+                return Ok(None);
             }
             thread::sleep(Duration::from_millis(10));
         }
     }
 
+    fn terminate_boundedly(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let pid = i32::try_from(self.child.id()).expect("Crush PID fits pid_t");
+        // Give Crush an opportunity to run its normal signal and terminal
+        // cleanup, even if the fixture left it suspended.
+        // SAFETY: `pid` identifies the owned test child while it is still live.
+        let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+        // SAFETY: the same positive PID remains scoped to the owned child.
+        let _ = unsafe { libc::kill(pid, libc::SIGCONT) };
+        if matches!(self.poll_for_exit(Duration::from_secs(1)), Ok(Some(_))) {
+            return;
+        }
+        // SAFETY: the grace period expired and `pid` still names only the
+        // wrapper process; SIGKILL cannot be caught or leave it stopped.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = self.poll_for_exit(Duration::from_secs(1));
+    }
+
     fn finish(mut self) -> (ExitStatus, Vec<u8>) {
         let status = self.wait_for_exit(Duration::from_secs(10));
-        drop(self.writer);
-        let output = self.reader.join().expect("join test PTY reader");
+        drop(self.writer.take());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !self
+            .reader
+            .as_ref()
+            .expect("test PTY reader is present")
+            .is_finished()
+        {
+            if Instant::now() >= deadline {
+                let _ = self.reader.take();
+                panic!("test PTY reader did not finish after Crush exited");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = self
+            .reader
+            .take()
+            .expect("test PTY reader is present")
+            .join()
+            .expect("join test PTY reader");
         (status, output)
     }
 }
 
-fn set_nonblocking(file: &File) -> libc::c_int {
-    let descriptor = file.as_raw_fd();
-    // SAFETY: `descriptor` is owned by `file` and remains live for this call.
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-    assert!(
-        flags >= 0,
-        "read test PTY descriptor flags: {}",
-        std::io::Error::last_os_error()
-    );
-    set_status_flags(file, flags | libc::O_NONBLOCK);
-    flags
+impl Drop for PtyRun {
+    fn drop(&mut self) {
+        self.terminate_boundedly();
+        drop(self.writer.take());
+        // Dropping a JoinHandle detaches the reader. This path runs only while
+        // unwinding a failed fixture; it must never hide the original failure
+        // behind another unbounded join.
+        let _ = self.reader.take();
+    }
 }
 
-fn set_status_flags(file: &File, flags: libc::c_int) {
-    let descriptor = file.as_raw_fd();
-    // SAFETY: `descriptor` is live and `flags` came from F_GETFL with only
-    // supported status flags optionally added.
-    let result = unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags) };
-    assert_eq!(
-        result,
-        0,
-        "set test PTY descriptor flags: {}",
-        std::io::Error::last_os_error()
-    );
+fn test_pty_is_writable(file: &File) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `descriptor` remains valid for this one-element, nonblocking
+        // poll and its fd is borrowed from the live `file`.
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("poll test PTY writability: {error}");
+        }
+        assert_eq!(
+            descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL),
+            0,
+            "test PTY reported an invalid or failed descriptor"
+        );
+        return descriptor.revents & libc::POLLOUT != 0;
+    }
 }
 
 fn wait_for_file(path: &Path) {
