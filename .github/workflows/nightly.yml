@@ -1,0 +1,143 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "23 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  regression-tests:
+    name: Extended regression tests on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+          - name: macOS Apple Silicon
+            runner: macos-15
+          - name: macOS Intel
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      PROPTEST_CASES: "4096"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+
+      - name: Run extended tests
+        run: cargo +stable test --all-targets --all-features --locked
+
+  tmux:
+    name: Remote tmux integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+
+      - name: Configure ephemeral localhost OpenSSH access
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes openssh-server tmux
+
+          ssh_key="$RUNNER_TEMP/crush-tmux-ed25519"
+          known_hosts="$RUNNER_TEMP/crush-tmux-known-hosts"
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "$ssh_key"
+          install -m 600 "$ssh_key.pub" "$HOME/.ssh/authorized_keys"
+
+          sudo install -d -m 755 /run/sshd
+          sudo ssh-keygen -A
+          sudo /usr/sbin/sshd
+
+          attempt=1
+          while [ "$attempt" -le 20 ]; do
+            if ssh-keyscan -T 1 localhost >"$known_hosts.tmp" 2>/dev/null && \
+              test -s "$known_hosts.tmp"; then
+              mv "$known_hosts.tmp" "$known_hosts"
+              break
+            fi
+            attempt=$((attempt + 1))
+            sleep 1
+          done
+          test -s "$known_hosts"
+
+          /usr/bin/ssh \
+            -F /dev/null \
+            -i "$ssh_key" \
+            -o BatchMode=yes \
+            -o ConnectionAttempts=1 \
+            -o ConnectTimeout=5 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o "UserKnownHostsFile=$known_hosts" \
+            localhost true
+
+      - name: Run tmux tests through OpenSSH
+        env:
+          CRUSH_RUN_TMUX_TESTS: "1"
+          CRUSH_TMUX_KNOWN_HOSTS: ${{ runner.temp }}/crush-tmux-known-hosts
+          CRUSH_TMUX_SSH_KEY: ${{ runner.temp }}/crush-tmux-ed25519
+        run: cargo +stable test --all-features --locked --test real_tmux -- --nocapture
+
+  release-build:
+    name: Release size and package smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+
+      - name: Build and package
+        run: |
+          cargo +stable build --release --locked
+          bytes=$(wc -c <target/release/crush | tr -d '[:space:]')
+          limit=$((5 * 1024 * 1024))
+          if [ "$bytes" -gt "$limit" ]; then
+            echo "target/release/crush is $bytes bytes; limit is $limit" >&2
+            exit 1
+          fi
+          version=$(cargo +stable metadata --no-deps --format-version 1 | \
+            jq -r '.packages[] | select(.name == "crush-ssh") | .version')
+          scripts/package-release.sh \
+            "$version" \
+            x86_64-unknown-linux-gnu \
+            target/release/crush \
+            target/release-assets

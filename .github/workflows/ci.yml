@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Format, lint, test, and document
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo +stable test --all-targets --all-features --locked
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --all-features --locked --no-deps
+
+  msrv:
+    name: Rust 1.85 compatibility
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install the minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.85.0
+
+      - name: Check every target
+        run: cargo +1.85.0 check --all-targets --all-features --locked
+
+  platform:
+    name: Test on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+          - name: macOS Apple Silicon
+            runner: macos-15
+          - name: macOS Intel
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+
+      - name: Run platform tests
+        run: cargo +stable test --all-targets --all-features --locked
+
+  linux-targets:
+    name: Check ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust target
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Check target
+        run: cargo +stable check --all-targets --all-features --locked --target "${{ matrix.target }}"
+
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          arguments: --all-features
+
+  shell-and-packaging:
+    name: Shell and packaging
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes shellcheck
+
+      - name: Check shell scripts
+        run: |
+          shellcheck install.sh scripts/*.sh
+          sh -n install.sh
+          sh -n scripts/package-release.sh
+
+      - name: Exercise installer argument handling
+        run: |
+          sh install.sh --help >/dev/null
+          if sh install.sh --unknown >/dev/null 2>&1; then
+            echo 'installer accepted an unknown option' >&2
+            exit 1
+          fi
+          if sh install.sh --version invalid >/dev/null 2>&1; then
+            echo 'installer accepted an invalid version' >&2
+            exit 1
+          fi
+
+      - name: Exercise verified install and collision handling
+        run: scripts/test-installer.sh
+
+      - name: Exercise release packaging
+        run: |
+          mkdir -p target/package-smoke
+          cp /bin/true target/package-smoke/crush
+          scripts/package-release.sh \
+            0.1.0 \
+            x86_64-unknown-linux-gnu \
+            target/package-smoke/crush \
+            target/package-smoke/dist
+          archive=target/package-smoke/dist/crush-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+          test -f "$archive"
+          test "$(tar -tzf "$archive" | LC_ALL=C sort)" = "$(printf '%s\n' \
+            LICENSE-APACHE LICENSE-MIT README.md crush | LC_ALL=C sort)"

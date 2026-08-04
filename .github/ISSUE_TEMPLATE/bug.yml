@@ -1,0 +1,72 @@
+name: Bug report
+description: Report incorrect behavior that is not security-sensitive
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security issues here. Use the private process in SECURITY.md.
+        Remove hostnames, usernames, keys, terminal payloads, and private paths.
+
+  - type: input
+    id: version
+    attributes:
+      label: Crush version
+      description: Output of `CRUSH_ACTION=version crush`
+      placeholder: crush 0.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, terminal, shell, OpenSSH, and tmux versions
+    validations:
+      required: true
+
+  - type: dropdown
+    id: prediction
+    attributes:
+      label: Does it reproduce with prediction disabled?
+      options:
+        - "Yes: CRUSH_PREDICT=off"
+        - "No: only with prediction enabled"
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: passthrough
+    attributes:
+      label: Does it reproduce in direct passthrough?
+      options:
+        - "Yes: CRUSH_MODE=passthrough"
+        - "No: only in the Crush PTY relay"
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Use a disposable host and redact sensitive details.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: This report contains no credential, private key, production terminal capture, or sensitive trace data.
+          required: true

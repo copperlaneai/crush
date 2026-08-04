@@ -1,0 +1,61 @@
+name: Tmux compatibility report
+description: Report a tmux screen, cursor, input, or prediction regression
+title: "bug(tmux): "
+labels: [bug, tmux]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tmux compatibility is a release gate. Please use a minimal `.tmux.conf`
+        and disposable session where possible. Use SECURITY.md instead if input
+        or secret data may have been exposed.
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Crush, OpenSSH, tmux, terminal, OS, and architecture
+    validations:
+      required: true
+
+  - type: textarea
+    id: topology
+    attributes:
+      label: Session topology
+      description: For example, physical terminal → Crush → remote tmux or local tmux → Crush → remote tmux
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal tmux configuration and commands
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: prediction
+    attributes:
+      label: Does `CRUSH_PREDICT=off` fix the issue?
+      options:
+        - "Yes"
+        - "No"
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: This report contains no credential, private key, production terminal capture, or sensitive trace data.
+          required: true
