@@ -24,7 +24,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::config::{Action, Config, Mode, Prediction, strip_crush_env};
 use crate::invocation::classify_ssh_invocation;
 use crate::prediction::{
-    ConfirmationResult, ConfirmedEcho, EchoConfirmation, ExpectedEcho, InputEffect,
+    ConfirmationResult, ConfirmedEcho, EchoConfidence, EchoConfirmation, ExpectedEcho, InputEffect,
     PredictionEngine, TerminalTrust,
 };
 use crate::pty::{PhysicalOutput, PhysicalTerminal, PtyChild, exec_ssh};
@@ -952,6 +952,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                         &mut desired_overlay,
                         &mut rearm_after_output,
                         &mut display,
+                        trace.as_ref(),
                     )?;
                     zeroize_prefix(&mut shadow_backlog, parse_len);
                 }
@@ -1063,7 +1064,10 @@ fn update_prediction_after_output(
     desired_overlay: &mut Vec<u8>,
     rearm_after_output: &mut bool,
     display: &mut SessionDisplay,
+    trace: Option<&Trace>,
 ) -> io::Result<()> {
+    let trust_before = predictor.terminal_trust();
+    let confidence_before = predictor.echo_confidence();
     let observation = shadow.advance(remote);
     reconcile_output(
         shadow,
@@ -1080,6 +1084,18 @@ fn update_prediction_after_output(
         echo_anchor,
         *rearm_after_output,
     );
+    if trust_before != TerminalTrust::Safe && predictor.terminal_trust() == TerminalTrust::Safe {
+        if let Some(trace) = trace {
+            trace.event("prediction_ready", &[]);
+        }
+    }
+    if confidence_before != EchoConfidence::Trusted
+        && predictor.echo_confidence() == EchoConfidence::Trusted
+    {
+        if let Some(trace) = trace {
+            trace.event("prediction_trusted", &[]);
+        }
+    }
     if shadow.can_overlay(desired_overlay.len()) {
         display.replace(desired_overlay)
     } else {

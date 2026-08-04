@@ -455,6 +455,7 @@ fn interactive_relay_draws_then_cleans_up_a_confirmed_prediction() {
     let probe_echoed = temp.file("probe-echoed");
     let predicted_file = temp.file("predicted.bin");
     let predicted_received = temp.file("predicted-received");
+    let trace_file = temp.file("trace.jsonl");
     let fake_ssh = temp.executable(
         "predicting-ssh",
         r#"#!/bin/sh
@@ -478,19 +479,21 @@ cat "$TEST_PREDICTED_FILE"
         .env("TEST_PROBE_ECHOED", &probe_echoed)
         .env("TEST_PREDICTED_FILE", &predicted_file)
         .env("TEST_PREDICTED_RECEIVED", &predicted_received)
+        .env("CRUSH_TRACE", &trace_file)
         .arg("user@example.test");
 
     let mut run = PtyRun::spawn(command, Some(SAFE_EPOCH));
     run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
     run.write_input(b"p");
     wait_for_file(&probe_echoed);
-    // The remote marker can precede the local relay's physical write. Wait for
-    // that write before allowing the sidecar to enter the trusted echo epoch.
+    // The remote marker can precede the local relay's physical write, while
+    // probe confirmation happens only after the sidecar parses that write.
     wait_for_output(&run, b"p");
-    thread::sleep(Duration::from_millis(100));
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_trusted\"");
     run.write_input(b"x");
     wait_for_file(&predicted_received);
-    thread::sleep(Duration::from_millis(100));
+    wait_for_output(&run, OVERLAY);
     let output_during_remote_delay = run.output_snapshot();
     let (status, output) = run.finish();
 
@@ -581,6 +584,7 @@ fn visible_prediction_is_cleared_before_explicit_suspend() {
     let probe_echoed = temp.file("probe-echoed");
     let predicted_file = temp.file("predicted.bin");
     let predicted_received = temp.file("predicted-received");
+    let trace_file = temp.file("trace.jsonl");
     let fake_ssh = temp.executable(
         "suspend-predicting-ssh",
         r#"#!/bin/sh
@@ -603,14 +607,16 @@ sleep 30
         .env("TEST_PROBE_ECHOED", &probe_echoed)
         .env("TEST_PREDICTED_FILE", &predicted_file)
         .env("TEST_PREDICTED_RECEIVED", &predicted_received)
+        .env("CRUSH_TRACE", &trace_file)
         .arg("user@example.test");
 
     let mut run = PtyRun::spawn(command, Some(SAFE_EPOCH));
     run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
     run.write_input(b"p");
     wait_for_file(&probe_echoed);
     wait_for_output(&run, b"p");
-    thread::sleep(Duration::from_millis(100));
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_trusted\"");
     run.write_input(b"x");
     wait_for_file(&predicted_received);
     wait_for_output(&run, OVERLAY);
@@ -970,6 +976,25 @@ fn wait_for_file(path: &Path) {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_file_contents(path: &Path, marker: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let contents = fs::read(path).unwrap_or_default();
+        if contents
+            .windows(marker.len())
+            .any(|window| window == marker)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {marker:?} in {}; contents={contents:?}",
             path.display()
         );
         thread::sleep(Duration::from_millis(10));
