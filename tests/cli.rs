@@ -663,7 +663,7 @@ fn input_backpressure_does_not_block_pause_or_signal_shutdown() {
         .writer
         .try_clone()
         .expect("duplicate controller for input flood");
-    set_nonblocking(&flooding_writer);
+    let original_flags = set_nonblocking(&flooding_writer);
     let block = [b'x'; 16 * 1024];
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut flooded_bytes = 0_usize;
@@ -681,6 +681,7 @@ fn input_backpressure_does_not_block_pause_or_signal_shutdown() {
         );
     }
     assert!(flooded_bytes > 0, "test PTY accepted no flood input");
+    set_status_flags(&flooding_writer, original_flags);
     drop(flooding_writer);
 
     run.signal(libc::SIGTSTP);
@@ -982,22 +983,28 @@ impl PtyRun {
     }
 }
 
-fn set_nonblocking(file: &File) {
+fn set_nonblocking(file: &File) -> libc::c_int {
     let descriptor = file.as_raw_fd();
-    // SAFETY: `descriptor` is owned by `file` and remains live for both calls.
+    // SAFETY: `descriptor` is owned by `file` and remains live for this call.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     assert!(
         flags >= 0,
         "read test PTY descriptor flags: {}",
         std::io::Error::last_os_error()
     );
-    // SAFETY: `descriptor` is live and `flags | O_NONBLOCK` is a valid status
-    // flag set for F_SETFL.
-    let result = unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    set_status_flags(file, flags | libc::O_NONBLOCK);
+    flags
+}
+
+fn set_status_flags(file: &File, flags: libc::c_int) {
+    let descriptor = file.as_raw_fd();
+    // SAFETY: `descriptor` is live and `flags` came from F_GETFL with only
+    // supported status flags optionally added.
+    let result = unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags) };
     assert_eq!(
         result,
         0,
-        "make test PTY descriptor nonblocking: {}",
+        "set test PTY descriptor flags: {}",
         std::io::Error::last_os_error()
     );
 }
