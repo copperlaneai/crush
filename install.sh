@@ -228,8 +228,9 @@ unpack_dir="${temporary_dir}/unpack"
 mkdir "$unpack_dir"
 tar -xzf "$archive" -C "$unpack_dir"
 
-[ -f "${unpack_dir}/crush" ] && [ ! -L "${unpack_dir}/crush" ] || \
+if [ ! -f "${unpack_dir}/crush" ] || [ -L "${unpack_dir}/crush" ]; then
     fail 'archive does not contain a regular crush executable'
+fi
 chmod 0755 "${unpack_dir}/crush"
 
 installed_version=$(
