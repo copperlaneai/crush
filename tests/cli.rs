@@ -665,24 +665,26 @@ fn input_backpressure_does_not_block_pause_or_signal_shutdown() {
         .expect("test PTY writer is open")
         .try_clone()
         .expect("duplicate controller for input flood");
+    let io_flags_guard = run.io_flags.lock().expect("lock test PTY descriptor flags");
+    let original_flags = set_nonblocking(&flooding_writer);
+    let block = [b'x'; 16 * 1024];
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut first_backpressure = None;
     let mut flooded_bytes = 0_usize;
     loop {
-        if !test_pty_is_writable(&flooding_writer) {
-            let now = Instant::now();
-            let backpressure_started = *first_backpressure.get_or_insert(now);
-            if now.saturating_duration_since(backpressure_started) >= Duration::from_millis(150) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        }
-        match flooding_writer.write(b"x") {
+        match flooding_writer.write(&block) {
             Ok(0) => panic!("test PTY accepted a zero-length input write"),
             Ok(count) => flooded_bytes = flooded_bytes.saturating_add(count),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                let backpressure_started = *first_backpressure.get_or_insert(now);
+                if now.saturating_duration_since(backpressure_started) >= Duration::from_millis(150)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
             Err(error) => panic!("flood test PTY input: {error}"),
         }
         assert!(
@@ -691,6 +693,8 @@ fn input_backpressure_does_not_block_pause_or_signal_shutdown() {
         );
     }
     assert!(flooded_bytes > 0, "test PTY accepted no flood input");
+    set_status_flags(&flooding_writer, original_flags);
+    drop(io_flags_guard);
     drop(flooding_writer);
 
     run.signal(libc::SIGTSTP);
@@ -826,6 +830,7 @@ struct PtyRun {
     ready: Receiver<()>,
     reader: Option<JoinHandle<Vec<u8>>>,
     observed: Arc<Mutex<Vec<u8>>>,
+    io_flags: Arc<Mutex<()>>,
 }
 
 impl PtyRun {
@@ -863,6 +868,8 @@ impl PtyRun {
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let reader_observed = Arc::clone(&observed);
+        let io_flags = Arc::new(Mutex::new(()));
+        let reader_io_flags = Arc::clone(&io_flags);
         let reader = thread::spawn(move || {
             if let Some(output_gate) = output_gate {
                 let _ = output_gate.recv();
@@ -871,6 +878,16 @@ impl PtyRun {
             let mut buffer = [0_u8; 4_096];
             let mut announced = false;
             loop {
+                poll_test_pty_output(&controller, -1);
+                let _io_flags_guard = reader_io_flags
+                    .lock()
+                    .expect("lock test PTY descriptor flags");
+                // Recheck after taking the descriptor-flags lock: the input
+                // flood may have temporarily changed the shared open-file
+                // description while the first poll was asleep.
+                if !poll_test_pty_output(&controller, 0) {
+                    continue;
+                }
                 match controller.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
@@ -907,6 +924,7 @@ impl PtyRun {
             ready,
             reader: Some(reader),
             observed,
+            io_flags,
         }
     }
 
@@ -1051,30 +1069,56 @@ impl Drop for PtyRun {
     }
 }
 
-fn test_pty_is_writable(file: &File) -> bool {
+fn poll_test_pty_output(file: &File, timeout_ms: libc::c_int) -> bool {
     let mut descriptor = libc::pollfd {
         fd: file.as_raw_fd(),
-        events: libc::POLLOUT,
+        events: libc::POLLIN | libc::POLLHUP,
         revents: 0,
     };
     loop {
-        // SAFETY: `descriptor` remains valid for this one-element, nonblocking
-        // poll and its fd is borrowed from the live `file`.
-        let result = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+        // SAFETY: `descriptor` remains valid for this one-element poll and its
+        // fd is borrowed from the live `file`.
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout_ms) };
         if result == -1 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            panic!("poll test PTY writability: {error}");
+            panic!("poll test PTY output: {error}");
         }
         assert_eq!(
-            descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL),
+            descriptor.revents & libc::POLLNVAL,
             0,
-            "test PTY reported an invalid or failed descriptor"
+            "test PTY output descriptor became invalid"
         );
-        return descriptor.revents & libc::POLLOUT != 0;
+        return descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
     }
+}
+
+fn set_nonblocking(file: &File) -> libc::c_int {
+    let descriptor = file.as_raw_fd();
+    // SAFETY: `descriptor` is owned by `file` and remains live for this call.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    assert!(
+        flags >= 0,
+        "read test PTY descriptor flags: {}",
+        std::io::Error::last_os_error()
+    );
+    set_status_flags(file, flags | libc::O_NONBLOCK);
+    flags
+}
+
+fn set_status_flags(file: &File, flags: libc::c_int) {
+    let descriptor = file.as_raw_fd();
+    // SAFETY: `descriptor` is live and `flags` came from F_GETFL with only
+    // supported status flags optionally added.
+    let result = unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags) };
+    assert_eq!(
+        result,
+        0,
+        "set test PTY descriptor flags: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn wait_for_file(path: &Path) {
