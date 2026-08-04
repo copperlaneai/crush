@@ -484,8 +484,9 @@ cat "$TEST_PREDICTED_FILE"
     run.wait_until_ready();
     run.write_input(b"p");
     wait_for_file(&probe_echoed);
-    // The marker is created immediately after the probe write. Allow the
-    // authoritative sidecar to parse it and enter the trusted echo epoch.
+    // The remote marker can precede the local relay's physical write. Wait for
+    // that write before allowing the sidecar to enter the trusted echo epoch.
+    wait_for_output(&run, b"p");
     thread::sleep(Duration::from_millis(100));
     run.write_input(b"x");
     wait_for_file(&predicted_received);
@@ -608,6 +609,7 @@ sleep 30
     run.wait_until_ready();
     run.write_input(b"p");
     wait_for_file(&probe_echoed);
+    wait_for_output(&run, b"p");
     thread::sleep(Duration::from_millis(100));
     run.write_input(b"x");
     wait_for_file(&predicted_received);
