@@ -1,113 +1,165 @@
 # Testing and release gates
 
-Crush tests behavior at three boundaries: bytes presented to OpenSSH, bytes
-presented to the physical terminal, and the final terminal state after temporary
-prediction is gone. Visual spot checks alone are not sufficient.
+Crush tests four boundaries: SSH invocation, authenticated datagrams, remote
+framebuffer state, and bytes presented to the physical terminal.
 
 ## Pull-request checks
 
-Every pull request must pass:
+Every pull request runs rustfmt, warning-denied Clippy, stable/MSRV builds,
+locked unit and integration tests on Linux/macOS, dependency policy, and release
+script checks. Public hosts and developer SSH credentials are forbidden in the
+normal test suite.
 
-- rustfmt and Clippy with warnings denied;
-- stable and Rust 1.85 builds with the lockfile;
-- unit, integration, property, and documentation tests on Linux and macOS;
-- dependency advisories, licenses, bans, and source policy; and
-- ShellCheck plus installer smoke tests when shell/release files change.
+## Mobile protocol layers
 
-Tests must not use public hosts or require developer SSH credentials. The
-network-free PR suite uses nested local PTYs and synthetic SSH executables. The
-nightly real-tmux smoke gate uses an ephemeral localhost key, disposable sshd,
-and throwaway tmux server/socket.
+### Cryptography and framing
 
-## Behavioral layers
+- Round-trip every packet kind and reject header/payload modification.
+- Require unique nonce coordinates across kind/sequence/fragment spaces.
+- Reject invalid markers, kinds, fragment coordinates, dimensions, codepoints,
+  compressed lengths, cursors, and inconsistent assemblies.
+- Reassemble reordered/duplicated fragments and cap incomplete generations.
+- Deduplicate/reorder input without writing any byte twice to the PTY.
 
-### Invocation compatibility
+### Screen state
 
-Compare Crush with plain SSH across option arity, non-UTF-8 arguments, config and
-authentication prompts, ProxyJump, forwarding, agent forwarding, multiplexing,
-remote commands, escape handling, EOF, signals, and child exit status. Assert
-that uncertain and noninteractive forms direct-exec OpenSSH.
+- Feed arbitrary terminal streams and resize sequences to the remote emulator.
+- Encode/compress/decode independent states and require exact cell, cursor,
+  mode, title, bell, prediction-policy, and input-ack equality.
+- Compare changed-cell rendering with full rendering in an independent terminal
+  model.
+- Exercise primary/alternate screen, wide characters, color/rendition, mouse,
+  focus, paste, application keys, Kitty keyboard flags, and terminal replies.
 
-### Byte identity
+### Prediction
 
-A recording child receives arbitrary input, paste, terminal replies, mouse/focus
-events, extended keys, and embedded NUL where the platform permits. Assert exact
-byte identity and order. With prediction off, assert exact output identity and no
-extra physical-terminal writes.
+Prediction tests require these invariants:
 
-### Shadow and overlay equivalence
+- one printable key causes a local paint without waiting for a frame;
+- every predicted cell uses an absolute coordinate;
+- no frame contains ICH (`CSI @`) or relative-backspace cursor cleanup;
+- occupied cells to the right retain their original coordinates;
+- side-by-side tmux prediction wraps to the active pane's left edge and never
+  addresses its divider or status row;
+- a pane-border change invalidates the old full-width prediction anchor;
+- unrelated status frames do not roll pending typing backward;
+- an echo-eligible frame whose authoritative cursor is still behind the local
+  cursor retains the unresolved conditional suffix;
+- a contradictory cell rolls back only after the authoritative cursor catches
+  up and the contradiction remains stable for the settlement interval;
+- matching authoritative cells consume the prediction without a visible erase;
+- backspace conditionally overwrites only the erased cell with a blank;
+- transport receipt does not expire a cell before delayed echo validation;
+- simple left/right movement is conditional, while bracketed paste, release
+  events, and unsupported input are not predicted;
+- ordinary Kitty printable/space/backspace encodings are recognized; and
+- raw/no-echo line editors remain eligible while common visible secret prompts
+  disable prediction.
 
-Tag remote writes separately from overlay writes and run both the Crush stream
-and a no-prediction reference through an independent terminal emulator. After
-remote quiescence or the stale-overlay deadline, require equality of:
+### End-to-end PTY
 
-- primary and alternate grids;
-- cursor position, shape, and visibility;
-- rendition, margins, modes, and wrap state; and
-- observable scrollback/history.
+`tests/mobile.rs` launches the public Crush binary under a real local PTY. A
+fake SSH executable performs `ssh -G` resolution and starts a real local
+`crush --server`; the client then uses the production encrypted UDP path and a
+second remote PTY. The fixture asserts local dim paint, authoritative shell
+echo, exit status, stationary right-side text, and absence of insert-character
+operations.
 
-Split every CSI, OSC, DCS, APC, PM, SOS, paste marker, UTF-8 sequence, and
-synchronized-update region at every possible byte boundary. Property tests vary
-chunking, malformed input, queue overflow, resize timing, and prediction
-rollback. Fuzz targets exercise parsers and state transitions without writing to
-a real terminal.
+The optional real-tmux test runs the same topology with tmux between the helper
+PTY and pane application:
 
-### Process lifecycle
+```sh
+CRUSH_RUN_MOBILE_TMUX_TESTS=1 \
+CRUSH_TMUX_BIN="$(command -v tmux)" \
+cargo test --test mobile --locked -- --nocapture
+```
 
-Inject partial reads/writes, `EINTR`, backpressure, PTY close, child exit, parent
-signal, stop/resume, panic, and rapid resize. Every path must restore termios,
-close descriptors, reap the child, and preserve the expected status. Verify
-exact zero-residue/cursor-restoring cleanup when a blocked writer becomes
-writable, bounded fallback when it remains full, input/PTY-read quiescence while
-settling, and the absence of old-coordinate erases after resize.
+It attaches a real tmux client, types beside occupied same-row text, verifies
+instant overwrite prediction, types at the final column of a side-by-side pane,
+requires the predicted cursor to wrap within that pane without addressing the
+divider, submits through the pane, detaches, and checks clean status propagation.
 
-## Tmux matrix
+Exercise authenticated ping/pong across the client's full 30-second silence
+timeout with:
 
-Remote tmux is a release gate, not a best-effort compatibility test. At release
-cut, pin the oldest supported tmux, representative distro versions, current
-stable, and a known source commit. Run each in an isolated environment over a
-real OpenSSH PTY.
+```sh
+CRUSH_RUN_MOBILE_IDLE_TESTS=1 \
+cargo test --test mobile mobile_helper_round_trip_is_local_and_never_inserts_same_row_text
+```
 
-Test physical → Crush → remote tmux, local tmux → Crush → remote tmux, and nested
-remote tmux. Cover default/custom configs and prefixes; pane/window lifecycle;
-copy/search/choose modes; command prompts and popups; attach/detach; paste;
-mouse/focus; alternate screens; synchronized panes; extended keys; OSC/DCS
-passthrough; queries/replies; rapid resize; and high-frequency status redraws.
+## SSH fallback layers
 
-Application fixtures include Bash, zsh, fish, Readline emacs/vi modes,
-Vim/Neovim modes, no-echo prompts, and a coding-agent-style output flood in one
-pane while typing in another. Compare child input, an independent emulator, and
-tmux capture/history with the plain-SSH reference.
+The legacy tests remain release gates for hosts/invocations that cannot use
+mobile transport:
 
-The intended release program runs the broad matrix and fuzzing. A release
-candidate must complete a 24-hour tmux soak with zero terminal-state mismatch or
-corruption.
+- byte-exact OpenSSH argv/environment and passthrough classification;
+- exact input/output ordering with prediction disabled;
+- shadow/overlay equivalence across split ANSI/UTF-8 sequences;
+- terminal cleanup, signal propagation, stop/resume, PTY hangup, resize, and
+  backpressure; and
+- existing local/remote tmux fixtures under xterm and Kitty synchronization.
 
-The repository currently automates the byte-level tmux transcript suite and one
-real OpenSSH attach/custom-`C-g`-prefix/detach smoke path. The rest of this
-matrix remains a release requirement, not a claim about the pre-1.0 test suite.
+Legacy fake-SSH tests set `CRUSH_TRANSPORT=ssh` explicitly so they do not
+mistake the intentional helper probe for the relay invocation under test.
+
+## Network fault matrix
+
+Release candidates run mobile sessions at 0, 20, 80, 200, and 500 ms RTT with
+0%, 1%, and burst packet loss, plus reordering and client address changes.
+Validate that:
+
+- no input byte is lost or duplicated;
+- an incomplete old frame never blocks a complete newer frame;
+- multiple complete frames already queued at the client produce one physical
+  paint of the newest state rather than a sequence of stale paints;
+- output rate adapts rather than growing a queue;
+- endpoint migration requires an authenticated packet;
+- reconnect notification begins promptly and screen state converges after
+  recovery; and
+- memory remains bounded at the maximum supported screen size.
+
+## Tmux and coding-agent matrix
+
+Remote tmux is a release gate. Cover maintained tmux versions, Bash/zsh/fish,
+default/custom prefixes, panes/windows, copy/search/choose modes, prompts,
+popups, attach/detach, mouse/focus, rapid resize, alternate-screen editors,
+nested tmux, and no-echo prompts.
+
+Coding-agent fixtures repaint input/status continuously and after every key.
+Run with ordinary, modifyOtherKeys, and Kitty keyboard input. One fixture keeps
+occupied placeholder/right-prompt text on the input row and verifies its cell
+coordinates never move during prediction. Cursor-stability fixtures require
+one-off deadline-snapshot coordinates to remain hidden, while repeated or quiet
+coordinates become authoritative.
+
+Before 1.0, run a 24-hour tmux + coding-output soak and compare periodic remote
+framebuffer captures with an independent client model. Any unrecovered cell or
+cursor mismatch blocks release.
 
 ## Performance gates
 
-Measure on dedicated Linux x86-64 and Apple Silicon hosts with release builds,
-at 0, 20, 80, 200, and 500 ms RTT and at 0% and 1% packet loss.
+Measure release builds on dedicated Linux x86-64 and Apple Silicon hosts.
 
 | Metric | Gate |
 | --- | --- |
-| Local input read → SSH PTY write during output flood | p99 ≤ 1 ms |
-| Trusted printable input read → completed disposable overlay | p99 ≤ 8 ms |
-| SSH PTY output read → physical write, added latency | p99 ≤ 2 ms |
-| 1 GiB sustained output throughput | ≥ 95% of plain SSH/raw relay |
-| PTY setup before SSH spawn | p95 ≤ 10 ms |
-| RSS at 200×60 and through a 1 GiB stream | ≤ 32 MiB and bounded |
-| Stripped release binary | ≤ 5 MiB |
+| Physical input read → UDP send | p99 ≤ 1 ms |
+| Printable input read → completed local overwrite paint | p99 ≤ 4 ms |
+| PTY output quiet/deadline → frame encryption send | p99 ≤ 20 ms |
+| Complete frame receipt → changed-cell physical write | p99 ≤ 4 ms |
+| Coding-agent stream display age at 80 ms RTT | p99 ≤ 1 RTT + 35 ms |
+| Input loss/duplication under 1% packet loss | zero |
+| RSS at 200×60 under continuous output | ≤ 48 MiB and bounded |
+| Compressed unchanged 200×60 frame | ≤ 10 KiB |
+| Stripped client/helper binary | ≤ 8 MiB |
 
-CI benchmark output is diagnostic until run on a controlled host. A maintainer
-must review and attach the dedicated-host report before a 1.0 release.
+`CRUSH_TRACE` exposes `mobile_local_paint.latency_us` and compressed frame sizes
+without payload content. Diagnostic benchmark numbers from shared CI do not
+replace a dedicated-host report.
 
 ## Release acceptance
 
-A release is blocked by any byte mismatch, unrecovered screen/cursor mismatch,
-terminal-restoration failure, tmux corruption, secret-prompt speculative echo,
-unbounded queue, performance-gate regression, unsupported dependency license,
-unresolved advisory, unverifiable archive, or installer collision failure.
+A release is blocked by authentication bypass, nonce reuse with differing
+plaintext, input loss/duplication, unrecovered screen mismatch, same-row cell
+movement, backward cursor cleanup, secret-prompt prediction in covered cases,
+terminal restoration failure, unbounded memory/queue growth, unsupported
+dependency policy, or installer/release-verification failure.

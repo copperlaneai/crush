@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +15,7 @@ use rustix_openpty::rustix::termios::Winsize;
 const PROMPT: &[u8] = b"CRUSH_TMUX_PROMPT>";
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn real_tmux_custom_prefix_detaches_through_openssh() {
@@ -28,12 +30,12 @@ fn real_tmux_custom_prefix_detaches_through_openssh() {
     require_file(Path::new("/usr/bin/tmux"));
 
     let temp = TestDir::new();
+    let trace = temp.path.join("trace.jsonl");
     let socket_name = format!(
         "crush-real-tmux-{}-{}",
         std::process::id(),
         unique_timestamp()
     );
-    let _server = TmuxServerGuard::new(&socket_name);
     let config = temp.write(
         "tmux.conf",
         "set-option -g prefix C-g\n\
@@ -68,9 +70,9 @@ fn real_tmux_custom_prefix_detaches_through_openssh() {
     command
         .env("CRUSH_SSH", "/usr/bin/ssh")
         .env("CRUSH_MODE", "force")
-        .env("CRUSH_PREDICT", "auto")
+        .env("CRUSH_PREDICT", "fast")
         .env_remove("CRUSH_ACTION")
-        .env_remove("CRUSH_TRACE")
+        .env("CRUSH_TRACE", &trace)
         .env("LC_ALL", "C")
         .env("TERM", "xterm-256color")
         .arg("-tt")
@@ -89,8 +91,23 @@ fn real_tmux_custom_prefix_detaches_through_openssh() {
         .arg(remote_command);
 
     let mut run = PtyProcess::spawn(command);
+    let _server = TmuxServerGuard::new(Path::new("/usr/bin/tmux"), &socket_name);
+    run.wait_for(b"\x1b[?996n", START_TIMEOUT)
+        .unwrap_or_else(|error| panic!("local tmux terminal queries did not appear: {error}"));
+    run.write_input(
+        b"\x1b[?1;2c\x1b[>0;136;0c\x1bP>|crush-test\x1b\\\
+          \x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\
+          \x1b[?997;2n",
+    )
+    .expect("answer local tmux terminal capability queries");
     run.wait_for(PROMPT, START_TIMEOUT)
         .unwrap_or_else(|error| panic!("real tmux prompt did not appear: {error}"));
+
+    run.write_input(b"echo CRUSH_TMUX_FAST\r")
+        .expect("type through fast tmux prediction");
+    run.wait_for(b"CRUSH_TMUX_FAST", START_TIMEOUT)
+        .unwrap_or_else(|error| panic!("fast tmux input did not render: {error}"));
+    wait_for_file_contents(&trace, b"\"event\":\"prediction_rendered\"");
 
     // The tmux configuration replaces the default prefix with Ctrl-G and
     // binds `q` in the prefix table to detach-client.
@@ -100,21 +117,388 @@ fn real_tmux_custom_prefix_detaches_through_openssh() {
         .finish(EXIT_TIMEOUT)
         .unwrap_or_else(|error| panic!("real tmux session did not exit cleanly: {error}"));
 
+    assert_real_tmux_result(status, &output, &trace);
+}
+
+#[test]
+fn local_tmux_fast_prediction_is_visibly_faint() {
+    if env::var_os("CRUSH_RUN_LOCAL_TMUX_TESTS").as_deref() != Some("1".as_ref()) {
+        eprintln!("skipping local tmux test; set CRUSH_RUN_LOCAL_TMUX_TESTS=1 and CRUSH_TMUX_BIN");
+        return;
+    }
+
+    let tmux = required_file("CRUSH_TMUX_BIN");
+    let client_term = env::var_os("CRUSH_TMUX_TERM").unwrap_or_else(|| "xterm-256color".into());
+    let settled_echo = if client_term.as_encoded_bytes() == b"xterm-kitty" {
+        b"\x1bP=1s\x1b\\\x1b[?25l \x08\x08x\x1b[?25h\x1bP=2s\x1b\\".as_slice()
+    } else {
+        b"\x1b[?2026h\x1b[?25l \x08\x08x\x1b[?25h\x1b[?2026l".as_slice()
+    };
+    let temp = TestDir::new();
+    let trace = temp.path.join("trace.jsonl");
+    let socket_name = format!(
+        "crush-local-tmux-{}-{}",
+        std::process::id(),
+        unique_timestamp()
+    );
+    let config = temp.write(
+        "tmux.conf",
+        "set-option -g prefix C-g\n\
+         unbind-key C-b\n\
+         bind-key q detach-client\n\
+         set-option -g status on\n\
+         set-option -g status-interval 1\n\
+         set-option -g status-right '#(date +%s)'\n",
+    );
+    let pane = temp.executable(
+        "pane.sh",
+        "#!/bin/sh\n\
+         PS1='CRUSH_TMUX_PROMPT>'\n\
+         export PS1\n\
+         exec /bin/sh -i\n",
+    );
+    let launcher = temp.executable(
+        "local-tmux-ssh.sh",
+        "#!/bin/sh\n\
+         exec \"$TEST_TMUX_BIN\" -L \"$TEST_SOCKET\" -f \"$TEST_CONFIG\" new-session -s crush-local \"$TEST_PANE\"\n",
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crush"));
+    command
+        .env("CRUSH_SSH", launcher)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env_remove("CRUSH_ACTION")
+        .env("CRUSH_TRACE", &trace)
+        .env("TEST_TMUX_BIN", &tmux)
+        .env("TEST_SOCKET", &socket_name)
+        .env("TEST_CONFIG", &config)
+        .env("TEST_PANE", &pane)
+        .env("LC_ALL", "C")
+        .env("TERM", &client_term)
+        .arg("local-fixture");
+
+    let mut run = PtyProcess::spawn(command);
+    let server = TmuxServerGuard::new(&tmux, &socket_name);
+    if let Err(error) = run.wait_for(b"\x1b[?996n", START_TIMEOUT) {
+        drop(server);
+        panic!("local tmux terminal queries did not appear: {error}");
+    }
+    run.write_input(
+        b"\x1b[?1;2c\x1b[>0;136;0c\x1bP>|crush-test\x1b\\\
+          \x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\
+          \x1b[?997;2n",
+    )
+    .expect("answer local tmux terminal capability queries");
+    if let Err(error) = run.wait_for(PROMPT, START_TIMEOUT) {
+        drop(server);
+        panic!("local tmux prompt did not appear: {error}");
+    }
+    thread::sleep(Duration::from_millis(2_200));
+    run.write_input(b"x").expect("type in local tmux fixture");
+    if let Err(error) = run.wait_for(b"\x1b[2mx\x1b[22m", Duration::from_secs(2)) {
+        drop(server);
+        panic!(
+            "fast prediction was not faint inside local tmux: {error}; trace={}",
+            String::from_utf8_lossy(&fs::read(&trace).unwrap_or_default())
+        );
+    }
+    if let Err(error) = run.wait_for(settled_echo, Duration::from_secs(2)) {
+        drop(server);
+        panic!(
+            "authoritative tmux echo did not settle behind a hidden cursor: {error}; trace={}",
+            String::from_utf8_lossy(&fs::read(&trace).unwrap_or_default())
+        );
+    }
+    drop(server);
+    drop(run);
+}
+
+#[test]
+fn local_tmux_coding_agent_keeps_every_key_composed() {
+    const INPUT: &[u8] = b"crushsync";
+    const PLACEHOLDER: &[u8] = b"Explain this codebase";
+    const WRAPPED_INPUT: &[u8] = b"wrap";
+    const WRAPPED_PLACEHOLDER: &[u8] = b"Explain this codebase";
+    if env::var_os("CRUSH_RUN_LOCAL_TMUX_TESTS").as_deref() != Some("1".as_ref()) {
+        eprintln!("skipping local tmux coding-agent test; set CRUSH_RUN_LOCAL_TMUX_TESTS=1");
+        return;
+    }
+
+    let tmux = required_file("CRUSH_TMUX_BIN");
+    let client_term = env::var_os("CRUSH_TMUX_TERM").unwrap_or_else(|| "xterm-256color".into());
+    let temp = TestDir::new();
+    let trace = temp.path.join("trace.jsonl");
+    let captured_input = temp.path.join("agent-input.bin");
+    let captured_wrapped_input = temp.path.join("agent-wrapped-input.bin");
+    let socket_name = format!(
+        "crush-agent-tmux-{}-{}",
+        std::process::id(),
+        unique_timestamp()
+    );
+    let config = temp.write("tmux.conf", "set-option -g status off\n");
+    let pane = temp.executable("agent-pane.sh", coding_agent_pane_script());
+    let launcher = temp.executable(
+        "local-agent-tmux-ssh.sh",
+        "#!/bin/sh\nexec \"$TEST_TMUX_BIN\" -L \"$TEST_SOCKET\" -f \"$TEST_CONFIG\" new-session -s crush-agent \"$TEST_PANE\"\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crush"));
+    command
+        .env("CRUSH_SSH", launcher)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env("CRUSH_TRACE", &trace)
+        .env("TEST_TMUX_BIN", &tmux)
+        .env("TEST_SOCKET", &socket_name)
+        .env("TEST_CONFIG", &config)
+        .env("TEST_PANE", &pane)
+        .env("TEST_AGENT_INPUT", &captured_input)
+        .env("TEST_INPUT_LEN", INPUT.len().to_string())
+        .env("TEST_AGENT_WRAPPED_INPUT", &captured_wrapped_input)
+        .env("TEST_WRAPPED_INPUT_LEN", WRAPPED_INPUT.len().to_string())
+        .env("LC_ALL", "C")
+        .env("TERM", &client_term)
+        .arg("local-agent-fixture");
+
+    let mut run = PtyProcess::spawn(command);
+    let server = TmuxServerGuard::new(&tmux, &socket_name);
+    answer_tmux_queries(&mut run);
+    run.wait_for(b"CRUSH_AGENT_READY", START_TIMEOUT)
+        .unwrap_or_else(|error| panic!("coding-agent prompt did not appear through tmux: {error}"));
+    exercise_agent_keys(&mut run, &trace, INPUT, PLACEHOLDER);
+    run.wait_for(b"CRUSH_AGENT_WRAP_READY", START_TIMEOUT)
+        .unwrap_or_else(|error| panic!("wrapped coding-agent prompt did not appear: {error}"));
+    exercise_wrapped_agent_keys(&mut run, &trace, WRAPPED_INPUT, WRAPPED_PLACEHOLDER);
+
+    let (status, output) = run
+        .finish(EXIT_TIMEOUT)
+        .unwrap_or_else(|error| panic!("tmux coding-agent fixture did not exit: {error}"));
+    drop(server);
     assert!(
         status.success(),
         "status={status}, output={}",
         visible(&output)
     );
+    assert_eq!(fs::read(captured_input).expect("read agent input"), INPUT);
+    assert_eq!(
+        fs::read(captured_wrapped_input).expect("read wrapped agent input"),
+        WRAPPED_INPUT
+    );
+    assert!(contains(&output, b"\x1b[?25l\x1b[10;3H\x1b[2mc\x1b[22m"));
+    let trace = fs::read_to_string(trace).expect("read coding-agent tmux trace");
+    assert_eq!(
+        trace.matches("\"event\":\"prediction_rendered\"").count(),
+        INPUT.len() + WRAPPED_INPUT.len(),
+        "every key must receive one immediate local render: {trace}"
+    );
     assert!(
-        contains(&output, PROMPT),
+        trace.matches("\"event\":\"tui_frame_composed\"").count()
+            >= INPUT.len() + WRAPPED_INPUT.len(),
+        "every tmux repaint must retain the software cursor: {trace}"
+    );
+    assert!(
+        !trace.contains("\"event\":\"prediction_blocked\""),
+        "{trace}"
+    );
+    assert!(!trace.contains("\"event\":\"prediction_stale\""), "{trace}");
+    assert!(!trace.contains("\"event\":\"shadow_lag\""), "{trace}");
+}
+
+fn coding_agent_pane_script() -> &'static str {
+    r#"#!/bin/sh
+stty raw -echo
+printf '\033[?2026h\033[2J\033[HCRUSH_AGENT_READY\033[10;1H\033[1m\342\200\272\033[22m\033[10;3H\033[2mExplain this codebase\033[22m\033[10;3H\033[?2026l'
+: > "$TEST_AGENT_INPUT"
+i=1
+while [ "$i" -le "$TEST_INPUT_LEN" ]; do
+    dd bs=1 count=1 2>/dev/null >> "$TEST_AGENT_INPUT"
+    printf '\033[?2026h\033[5;1H\033[2mThinking %s\033[22m\033[10;3H\033[?2026l' "$i"
+    i=$((i + 1))
+done
+sleep 0.1
+printf '\033[?2026h\033[10;3H'
+cat "$TEST_AGENT_INPUT"
+printf '\033[?2026l'
+sleep 0.1
+printf '\033[?2026h\033[2J\033[HCRUSH_AGENT_WRAP_READY\033[10;77H\033[1m\342\200\272\033[22m\033[10;79H\033[2mEx\033[22m\033[11;1H\033[2mplain this codebase\033[22m\033[10;79H\033[?2026l'
+: > "$TEST_AGENT_WRAPPED_INPUT"
+i=1
+while [ "$i" -le "$TEST_WRAPPED_INPUT_LEN" ]; do
+    dd bs=1 count=1 2>/dev/null >> "$TEST_AGENT_WRAPPED_INPUT"
+    printf '\033[?2026h\033[5;1H\033[2mWrapping %s\033[22m\033[10;79H\033[?2026l' "$i"
+    i=$((i + 1))
+done
+sleep 0.1
+printf '\033[?2026h\033[10;79Hwr\033[11;1Hap\033[11;3H\033[?2026l'
+sleep 0.1
+"#
+}
+
+fn exercise_agent_keys(run: &mut PtyProcess, trace: &Path, input: &[u8], placeholder: &[u8]) {
+    let rendered_before = trace_event_count(trace, b"\"event\":\"prediction_rendered\"");
+    let composed_before = trace_event_count(trace, b"\"event\":\"tui_frame_composed\"");
+    for (index, &byte) in input.iter().enumerate() {
+        run.write_input(&[byte])
+            .expect("type coding-agent key through tmux");
+        wait_for_file_event_count(
+            trace,
+            b"\"event\":\"prediction_rendered\"",
+            rendered_before + index + 1,
+        );
+        let local_frame = expected_local_cursor_append(byte, placeholder[index + 1], index);
+        run.wait_for(&local_frame, Duration::from_secs(2))
+            .unwrap_or_else(|error| {
+                panic!("key {index} lacked its software cursor frame: {error}")
+            });
+        wait_for_file_event_count(
+            trace,
+            b"\"event\":\"tui_frame_composed\"",
+            composed_before + index + 1,
+        );
+    }
+}
+
+fn exercise_wrapped_agent_keys(
+    run: &mut PtyProcess,
+    trace: &Path,
+    input: &[u8],
+    placeholder: &[u8],
+) {
+    let rendered_before = trace_event_count(trace, b"\"event\":\"prediction_rendered\"");
+    let composed_before = trace_event_count(trace, b"\"event\":\"tui_frame_composed\"");
+    for (index, &byte) in input.iter().enumerate() {
+        run.write_input(&[byte])
+            .expect("type wrapped coding-agent key through tmux");
+        wait_for_file_event_count(
+            trace,
+            b"\"event\":\"prediction_rendered\"",
+            rendered_before + index + 1,
+        );
+        let software_cursor = expected_wrapped_software_cursor(index + 1, placeholder[index + 1]);
+        run.wait_for(&software_cursor, Duration::from_secs(2))
+            .unwrap_or_else(|error| {
+                panic!("wrapped key {index} lacked its absolute software cursor: {error}")
+            });
+        wait_for_file_event_count(
+            trace,
+            b"\"event\":\"tui_frame_composed\"",
+            composed_before + index + 1,
+        );
+    }
+}
+
+fn expected_wrapped_software_cursor(input_len: usize, cursor_underlay: u8) -> Vec<u8> {
+    const COLUMNS: usize = 80;
+    const ANCHOR_ROW: usize = 10;
+    const ANCHOR_COLUMN: usize = 79;
+
+    let linear_column = ANCHOR_COLUMN - 1 + input_len;
+    let row = ANCHOR_ROW + linear_column / COLUMNS;
+    let column = linear_column % COLUMNS + 1;
+    format!(
+        "\x1b[{row};{column}H\x1b[2;7m{}\x1b[22;27m\x1b[{row};{column}H",
+        char::from(cursor_underlay)
+    )
+    .into_bytes()
+}
+
+fn expected_local_cursor_append(byte: u8, cursor_underlay: u8, index: usize) -> Vec<u8> {
+    let cell_column = 3 + index;
+    let cursor_column = cell_column + 1;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(format!("\x1b[10;{cell_column}H").as_bytes());
+    frame.extend_from_slice(&[b'\x1b', b'[', b'2', b'm', byte]);
+    frame.extend_from_slice(b"\x1b[22m");
+    frame.extend_from_slice(format!("\x1b[10;{cursor_column}H").as_bytes());
+    if cursor_underlay == b' ' {
+        frame.extend_from_slice(&[b'\x1b', b'[', b'7', b'm', cursor_underlay]);
+        frame.extend_from_slice(b"\x1b[27m");
+    } else {
+        frame.extend_from_slice(b"\x1b[2;7m");
+        frame.push(cursor_underlay);
+        frame.extend_from_slice(b"\x1b[22;27m");
+    }
+    frame.extend_from_slice(format!("\x1b[10;{cursor_column}H").as_bytes());
+    frame
+}
+
+fn answer_tmux_queries(run: &mut PtyProcess) {
+    run.wait_for(b"\x1b[?996n", START_TIMEOUT)
+        .unwrap_or_else(|error| panic!("local tmux terminal queries did not appear: {error}"));
+    run.write_input(
+        b"\x1b[?1;2c\x1b[>0;136;0c\x1bP>|crush-test\x1b\\\
+          \x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\
+          \x1b[?997;2n",
+    )
+    .expect("answer local tmux terminal capability queries");
+}
+
+fn assert_real_tmux_result(status: ExitStatus, output: &[u8], trace: &Path) {
+    assert!(
+        status.success(),
+        "status={status}, output={}",
+        visible(output)
+    );
+    assert!(
+        contains(output, PROMPT),
         "tmux pane prompt was absent: {}",
-        visible(&output)
+        visible(output)
     );
     assert!(
-        contains(&output, b"detached"),
+        contains(output, b"detached"),
         "tmux did not report a detach: {}",
-        visible(&output)
+        visible(output)
     );
+    assert!(
+        contains(
+            &fs::read(trace).expect("read real tmux prediction trace"),
+            b"\"event\":\"prediction_rendered\""
+        ),
+        "fast prediction never rendered inside tmux"
+    );
+}
+
+fn wait_for_file_contents(path: &Path, marker: &[u8]) {
+    let deadline = Instant::now() + START_TIMEOUT;
+    loop {
+        let contents = fs::read(path).unwrap_or_default();
+        if contains(&contents, marker) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {marker:?} in {}; contents={contents:?}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_file_event_count(path: &Path, marker: &[u8], expected: usize) {
+    let deadline = Instant::now() + START_TIMEOUT;
+    loop {
+        let contents = fs::read(path).unwrap_or_default();
+        let count = contents
+            .windows(marker.len())
+            .filter(|window| *window == marker)
+            .count();
+        if count >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} {marker:?} events; contents={contents:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn trace_event_count(path: &Path, marker: &[u8]) -> usize {
+    fs::read(path)
+        .unwrap_or_default()
+        .windows(marker.len())
+        .filter(|window| *window == marker)
+        .count()
 }
 
 fn required_file(variable: &str) -> PathBuf {
@@ -148,11 +532,13 @@ fn shell_quote(value: impl AsRef<Path>) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn unique_timestamp() -> u128 {
-    SystemTime::now()
+fn unique_timestamp() -> String {
+    let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
+        .as_nanos();
+    let counter = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{timestamp}-{counter}")
 }
 
 struct TestDir {
@@ -191,12 +577,14 @@ impl Drop for TestDir {
 }
 
 struct TmuxServerGuard {
+    program: PathBuf,
     socket_name: String,
 }
 
 impl TmuxServerGuard {
-    fn new(socket_name: &str) -> Self {
+    fn new(program: &Path, socket_name: &str) -> Self {
         Self {
+            program: program.to_owned(),
             socket_name: socket_name.to_owned(),
         }
     }
@@ -204,7 +592,7 @@ impl TmuxServerGuard {
 
 impl Drop for TmuxServerGuard {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/tmux")
+        let _ = Command::new(&self.program)
             .args(["-L", &self.socket_name, "kill-server"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

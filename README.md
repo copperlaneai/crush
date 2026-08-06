@@ -1,54 +1,73 @@
 # Crush
 
-**Crisp Remote Uninterrupted Shell** — a low-latency, byte-transparent wrapper
-around the OpenSSH client.
+**Crisp Remote Uninterrupted Shell** — a responsive remote terminal built on
+SSH authentication and Mosh-style screen synchronization.
 
 > [!WARNING]
-> The executable is named `crush`. It conflicts with
-> [Charmbracelet's Crush](https://github.com/charmbracelet/crush). The installer
-> refuses to replace any existing `crush` path unless `--force` is supplied.
+> Crush is pre-1.0 software. The executable name also conflicts with
+> [Charmbracelet's Crush](https://github.com/charmbracelet/crush); the installer
+> never replaces an existing `crush` path unless `--force` is supplied.
 
-Crush keeps the SSH implementation you already trust. It launches the system
-`ssh` binary with the arguments you supplied, relays its PTY without batching,
-and locally predicts only text that it has learned is safe to echo. Authentication,
-host-key verification, connection setup, forwarding, and encryption remain
-OpenSSH's responsibility.
+```sh
+crush user@example.com
+```
 
-Crush is pre-1.0 software. It should not yet be used as the only way to reach a
-critical machine.
+For an interactive login shell, Crush uses OpenSSH to authenticate and launch
+an unprivileged `crush --server` helper. Keystrokes and authoritative terminal
+screen states then travel over authenticated, encrypted UDP. The server sends
+the newest framebuffer instead of making the client replay every intermediate
+terminal byte, so streamed coding-agent output cannot build a stale display
+queue.
 
-## Why
+The helper detaches after the one-time key and port are delivered, so the SSH
+bootstrap closes and the live terminal no longer depends on a TCP connection.
 
-At interactive-network latencies, ordinary SSH makes each typed character feel
-one round trip behind. Some wrappers hide that delay by taking ownership of the
-terminal screen, but doing so can corrupt tmux, full-screen applications, paste,
-terminal queries, or newer keyboard protocols.
+If the helper or direct UDP is unavailable, `CRUSH_TRANSPORT=auto` falls back to
+the existing OpenSSH PTY relay. Noninteractive commands, forwarding, subsystems,
+configuration queries, and uncertain SSH option forms still execute OpenSSH
+directly.
 
-Crush is built around a stricter rule: remote bytes always win. Prediction is a
-disposable visual overlay; it is never part of the authoritative terminal state.
-If Crush cannot prove that prediction is safe, it immediately behaves like plain
-SSH.
+## Why it feels local
 
-## Design promises
+- Printable input is painted immediately at absolute screen coordinates.
+- Prediction is an **overwrite-only overlay**. It never inserts a cell or moves
+  existing text on the row, fixing Mosh's default same-row/right-prompt shift.
+- Authoritative remote snapshots confirm or replace predicted cells inside one
+  synchronized terminal update—there is no erase-then-rewind cleanup phase.
+- Remote snapshots are independent, LZ4-compressed states. Missing or obsolete
+  frames can be skipped instead of blocking newer coding-agent output.
+- Input packets are sequenced and retransmitted independently of screen frames.
+- A valid packet from a new client address updates the session endpoint, which
+  allows ordinary network roaming while the local process remains alive.
 
-- **OpenSSH compatible.** `crush user@host` accepts the same arguments as
-  `ssh user@host`; Crush-specific settings live in the environment.
-- **Byte transparent.** Input and output are forwarded exactly once, in order,
-  without semantic re-encoding or synthetic terminal replies.
-- **tmux native.** Remote tmux uses its normal terminal protocol. Crush reserves
-  no prefix key and requires no tmux plugin or configuration.
-- **Fail passive.** Parser lag, unfamiliar terminal state, and prediction
-  disagreement disable the overlay rather than slowing or altering the session.
-- **Private by default.** There is no telemetry. Optional traces contain timing
-  and state metadata, never keystrokes or terminal payloads.
+Mosh exposes its equivalent overwrite behavior as `mosh -o` or
+`mosh --predict-overwrite`. Crush makes that behavior unconditional because
+moving unrelated tmux, prompt, or coding-agent text is never a valid local
+prediction.
 
-See [Architecture](docs/architecture.md), [Compatibility](docs/compatibility.md),
-and the [Security model](docs/security-model.md) for the detailed contracts.
+## Tmux and coding agents
+
+The remote helper owns the terminal emulator outside tmux, so it receives
+tmux's authoritative final display rather than trying to infer nested redraws
+from a client-side SSH byte stream. Crush synchronizes application cursor,
+keypad, mouse, focus, bracketed-paste, alternate-screen, and Kitty keyboard
+modes with the local terminal.
+
+Zsh line editing, tmux, and coding agents all normally put their outer PTY in
+raw/no-echo mode and draw input themselves. Crush therefore uses visible-screen
+context instead of the kernel `ECHO` bit, while blocking common password,
+passphrase, secret, token, and login prompt shapes. Bracketed-paste payloads and
+ambiguous controls are never predicted; simple left/right cursor motion is
+conditional and corrected by the next authoritative state.
+
+The mobile transport has automated real-PTY and real-tmux coverage, including
+same-row text that must remain stationary while a predicted character appears.
 
 ## Install
 
-Release archives will support macOS and Linux on x86-64 and ARM64. Inspect the
-installer before piping it to a shell:
+Crush must be available locally and on the remote host for the mobile transport.
+Release archives target macOS and Linux on x86-64 and ARM64. Inspect the
+installer before running it:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSLO \
@@ -57,91 +76,72 @@ less install.sh
 sh install.sh
 ```
 
-The default destination is `~/.local/bin/crush`. Pin a version or choose another
-directory with:
+Run the same installer on the server, or copy a matching release binary to a
+directory in its `PATH`, normally `~/.local/bin/crush`. The helper is
+unprivileged and is launched only after successful SSH authentication.
+
+```sh
+ssh user@example.com 'command -v crush && crush --version'
+```
+
+The default local destination is `~/.local/bin/crush`. To pin a version or
+choose a different directory:
 
 ```sh
 sh install.sh --version 0.1.0 --dir "$HOME/bin"
 ```
 
-The installer verifies the archive against the release's `SHA256SUMS`. If
-`cosign` is installed, it also verifies the checksum manifest's Sigstore bundle.
-It never executes an existing destination to identify it; reinstalling or
-upgrading in place requires `--force`.
-See [Release verification](docs/releasing.md#verify-a-release) for a fully
-authenticated manual flow.
+The installer checks the release archive against `SHA256SUMS` and, when Cosign
+is available, verifies the checksum manifest's Sigstore bundle. See
+[release verification](docs/releasing.md#verify-a-release).
 
-## Use
+## Use and configuration
 
-Use `crush` anywhere you would normally start an interactive SSH session:
+Crush does not consume ordinary SSH options:
 
 ```sh
 crush user@example.com
-crush -J bastion.internal user@app.internal
 crush -i ~/.ssh/work_ed25519 user@example.com
+crush -p 2222 user@example.com
 ```
 
-Noninteractive, forwarding-only, configuration, multiplex-control, and uncertain
-invocations are passed directly to OpenSSH.
-
-Crush consumes no command-line flags of its own. Configuration is environment
-only:
+Crush-specific configuration is environment-only and is removed before any SSH
+or remote shell process starts:
 
 | Variable | Values | Purpose |
 | --- | --- | --- |
-| `CRUSH_SSH` | executable path | Select a specific OpenSSH client. |
-| `CRUSH_MODE` | `auto`, `passthrough`, `force` | Select conservative auto-detection, direct execution, or a required interactive PTY relay. |
-| `CRUSH_PREDICT` | `auto`, `off` | Enable conservative learned prediction or use the raw relay only. |
-| `CRUSH_TRACE` | file path | Write a private metadata-only diagnostic trace. |
-| `CRUSH_ACTION` | `version`, `doctor` | Print build information or run local diagnostics without connecting. |
+| `CRUSH_TRANSPORT` | `auto`, `mobile`, `ssh` | Prefer mobile with fallback, require it, or use the legacy SSH relay. |
+| `CRUSH_SERVER` | remote command/path | Select the remote helper executable (default `crush`). |
+| `CRUSH_PORT` | port or `FIRST:LAST` | Select the server UDP port/range (default `60000:61000`). |
+| `CRUSH_SSH` | executable path | Select a local OpenSSH client. |
+| `CRUSH_MODE` | `auto`, `passthrough`, `force` | Classify normally, execute SSH directly, or require an interactive wrapper. |
+| `CRUSH_PREDICT` | `auto`, `fast`, `off` | Enable prediction, force first-key prediction in the SSH fallback, or disable it. |
+| `CRUSH_TRACE` | file path | Write private timing/state metadata without terminal or keystroke contents. |
+| `CRUSH_ACTION` | `version`, `doctor` | Run a local diagnostic action. |
 
-All `CRUSH_*` variables are removed from the child SSH environment.
-
-To compare behavior with plain SSH:
+Examples:
 
 ```sh
-CRUSH_PREDICT=off crush user@example.com
-CRUSH_MODE=passthrough crush user@example.com
+# Require the new helper instead of silently falling back.
+CRUSH_TRANSPORT=mobile crush user@example.com
+
+# Compare with the byte-transparent SSH relay.
+CRUSH_TRANSPORT=ssh CRUSH_PREDICT=off crush user@example.com
+
+# Use a helper installed outside remote PATH.
+CRUSH_SERVER='$HOME/bin/crush' crush user@example.com
 ```
 
-Prediction deliberately does not assume that the untouched part of an existing
-terminal line is blank. It arms only after remote output establishes default
-rendition, then clears the screen and anchors an absolute cursor. The ordering
-matters because a later rendition reset cannot prove the attributes of cells
-erased earlier. Tmux and full-screen programs normally perform complete redraws,
-but Crush may stay raw-relay-only through startup or an ambiguous frame until a
-safe redraw appears. This is a conservative pre-1.0 limitation, not a connection
-failure.
+The first mobile version supports interactive login shells over directly
+reachable IPv4 UDP. `ProxyJump`, `ProxyCommand`, remote commands, forwarding,
+and an unavailable helper use SSH behavior in `auto`. The server chooses the
+first available port in `60000:61000` by default; firewalls/security groups must
+allow the configured datagram range. A single pre-opened port can be selected
+with `CRUSH_PORT=60000`.
 
-After skipped output or suspend/resume, Crush also treats the terminal's parser
-grammar as unknown. It remains raw-relay-only unless authoritative output proves
-ANSI mode by emitting the Tektronix exit (`ESC ETX`) and VT52 ANSI exit
-(`ESC <`), then resets the terminal. Both exits are required even after one
-switch command because either optional emulator can ignore that command. This
-avoids treating a RIS ignored by VT52 or Tektronix mode as a safe redraw.
+## Build and test
 
-Automatic prediction is enabled only for recognized VT/xterm-style `TERM`
-families and assumes the conventional terminal mode state at a normal shell
-application boundary—the same starting state tmux expects. Crush emits no
-terminal normalization at startup. Unknown/custom terminals still receive the
-full byte-transparent raw relay; use `CRUSH_PREDICT=off` for launchers that
-intentionally hand applications an unusual inherited display state.
-
-Resize handling never erases at pre-resize coordinates. Suspend and termination
-pause input and attempt exact overlay cleanup for a bounded 100 ms; if the
-physical terminal stays unwritable, Crush restores terminal ownership instead
-of hanging, and a partial plain-text overlay may remain until the next
-authoritative redraw.
-
-For normal password prompts, the prompt/output barrier and an undrawn probe keep
-secret input out of the overlay. A client-only wrapper cannot detect an
-application that silently disables remote echo after a previously trusted
-character stream. Set `CRUSH_PREDICT=off` before entering secrets into an
-application with that unusual behavior.
-
-## Build
-
-Crush uses Rust 2024 and has a minimum supported Rust version of 1.85.
+Crush uses Rust 2024 with a minimum supported Rust version of 1.85.
 
 ```sh
 cargo +stable build --locked
@@ -149,21 +149,31 @@ cargo +stable test --all-targets --all-features --locked
 cargo +stable clippy --all-targets --all-features --locked -- -D warnings
 ```
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes, especially
-changes that touch terminal bytes, process creation, or prediction.
+Run the real local tmux mobile path with:
 
-## Status and scope
+```sh
+CRUSH_RUN_MOBILE_TMUX_TESTS=1 \
+CRUSH_TMUX_BIN="$(command -v tmux)" \
+cargo +stable test --test mobile --locked -- --nocapture
+```
 
-Version 1 is a POSIX client for Linux and macOS. It improves perceived input
-latency and avoids wrapper-induced output delay, but it cannot make bytes arrive
-from a server sooner than OpenSSH does. Session roaming, reconnect/resume,
-Windows/ConPTY, and an optional remote helper are intentionally deferred.
+See [Architecture](docs/architecture.md),
+[Compatibility](docs/compatibility.md), [Testing](docs/testing.md), and the
+[Security model](docs/security-model.md) for the detailed contracts.
+
+## Current limits
+
+- The remote helper and wire protocol are new and not yet interoperable across
+  different Crush versions.
+- Only the visible framebuffer is synchronized; local scrollback reconstruction
+  is not yet implemented.
+- Combining marks and OSC 8 hyperlink metadata are not yet serialized with cell
+  snapshots, though their base text remains visible.
+- IPv6-only mobile sessions and UDP tunneling through SSH jump hosts are not yet
+  implemented and fall back to SSH in `auto`.
+- A local process restart cannot resume an existing remote session yet.
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)), or
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Licensed under either Apache-2.0 or MIT at your option. See
+[LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).

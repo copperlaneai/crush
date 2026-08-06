@@ -8,165 +8,105 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// The minimum time an unconfirmed prediction may remain pending.
 pub const MIN_STALE_DEADLINE: Duration = Duration::from_millis(750);
 
-/// The maximum time an unconfirmed prediction may remain pending.
 pub const MAX_STALE_DEADLINE: Duration = Duration::from_secs(3);
 
-/// The default bound on retained, unconfirmed input operations.
 pub const DEFAULT_MAX_PENDING: usize = 256;
 
-/// Whether the authoritative terminal model is safe to use as an overlay anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalTrust {
-    /// There is not yet enough terminal state to place an overlay safely.
     Unknown,
-    /// Cursor, modes, and underlying cells are known and safe.
     Safe,
-    /// Parsing or state reconciliation has become unreliable.
     Tainted,
 }
 
-/// Confidence that the remote application is performing simple linear echo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoConfidence {
-    /// The next safe character will be forwarded as an undrawn probe.
     Cold,
-    /// An undrawn probe is awaiting an authoritative echo.
     Probe,
-    /// Linear echo was confirmed and safe characters may be overlaid.
     Trusted,
-    /// Prediction is disabled until the caller establishes a new safe anchor.
     Quarantined,
 }
 
-/// Why an input byte is unsafe for local echo prediction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputBarrier {
-    /// A C0 control byte other than Escape or Backspace.
     Control(u8),
-    /// The opening Escape byte of a terminal sequence.
     Escape,
-    /// A byte belonging to an Escape sequence.
     EscapeSequence,
-    /// The final byte of a bracketed-paste opening marker.
     PasteStart,
-    /// A byte inside bracketed paste, including partial closing markers.
     PasteData,
-    /// The final byte of a bracketed-paste closing marker.
     PasteEnd,
-    /// A non-ASCII byte. V1 deliberately does not predict Unicode input.
     NonAscii(u8),
 }
 
-/// Exact conservative classification of one input byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputClass {
-    /// A single-column printable ASCII byte (`0x20..=0x7e`).
     SafePrintable(u8),
-    /// Either ASCII Backspace (`0x08`) or Delete (`0x7f`).
     Backspace(u8),
-    /// Input that forms a prediction barrier.
     Barrier(InputBarrier),
 }
 
-/// Why the current prediction epoch was suspended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetReason {
-    /// Input crossed a control, escape, paste, or non-ASCII boundary.
     InputBarrier,
-    /// The terminal model is not currently trustworthy.
     TerminalUntrusted,
-    /// Backspace targeted confirmed rather than unresolved predicted text.
     UnsafeBackspace,
-    /// An authoritative echo contradicted the expected input operation.
     EchoMismatch,
-    /// The bounded pending-operation queue filled.
     PendingLimit,
-    /// The oldest pending operation exceeded its adaptive deadline.
     Stale,
-    /// Authoritative output invalidated the current overlay anchor.
     AuthoritativeChange,
 }
 
-/// Work the renderer must perform when an epoch is suspended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResetEffect {
-    /// Number of currently visible speculative characters to remove.
     pub rollback_chars: usize,
-    /// Cause of the reset.
     pub reason: ResetReason,
 }
 
-/// Optional local action associated with a classified input byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEffect {
-    /// Forward the original byte, but do not alter the local overlay.
     ForwardOnly,
-    /// Forward this byte as the undrawn confidence probe.
     Probe { byte: u8 },
-    /// Append one disposable speculative character to the overlay.
     DrawAppend { byte: u8 },
-    /// Remove the last unresolved speculative character from the overlay.
     DrawBackspace { erased: u8 },
-    /// Remove the indicated overlay suffix and suspend prediction.
+    Submit,
     Suspend(ResetEffect),
 }
 
-/// Classification and overlay effect for one byte observed by the side tap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputDecision {
-    /// The byte's conservative semantic class.
     pub class: InputClass,
-    /// The optional overlay action. The original byte must still be forwarded.
     pub effect: InputEffect,
 }
 
-/// The next remote operation the shadow terminal may authoritatively confirm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpectedEcho {
-    /// A printable echo, with whether it is currently present in the overlay.
     Printable { byte: u8, visible: bool },
-    /// An application-specific erasure corresponding to a forwarded backspace.
     Backspace,
 }
 
-/// A confirmation supplied after the shadow terminal recognizes authoritative output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoConfirmation {
-    /// The remote application echoed this exact printable byte at the expected anchor.
     Printable(u8),
-    /// The remote application authoritatively applied the expected backspace.
     Backspace,
 }
 
-/// What kind of pending operation was confirmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmedEcho {
-    /// The first, deliberately undrawn confidence probe.
     Probe,
-    /// A later printable operation.
     Printable { byte: u8, was_visible: bool },
-    /// A predicted backspace operation.
     Backspace,
 }
 
-/// Result of reconciling authoritative output with pending input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmationResult {
-    /// There was no pending input to confirm.
     NothingPending,
-    /// The next pending operation matched.
     Matched {
-        /// The operation that matched.
         echo: ConfirmedEcho,
-        /// RTT sample for this operation.
         sample_rtt: Duration,
-        /// Smoothed RTT after incorporating the sample.
         measured_rtt: Duration,
     },
-    /// The confirmation contradicted the expected operation.
     Mismatch(ResetEffect),
 }
 
@@ -192,8 +132,7 @@ impl PendingOperation {
 
     fn zero_byte(&mut self) {
         if let Self::Append { byte, .. } = self {
-            // Best-effort erasure without adding a dependency to this core module.
-            // The queue is also bounded and never exposed through diagnostics.
+            // Best-effort erasure for bounded, unexposed queue storage.
             *byte = 0;
             std::hint::black_box(byte);
         }
@@ -225,11 +164,12 @@ impl InputParseState {
     }
 }
 
-/// Dependency-free prediction state machine for a single interactive session.
 #[derive(Debug)]
 pub struct PredictionEngine {
     terminal_trust: TerminalTrust,
     echo_confidence: EchoConfidence,
+    immediate_echo: bool,
+    submitted: bool,
     input_state: InputParseState,
     pending: VecDeque<PendingOperation>,
     max_pending: usize,
@@ -243,20 +183,32 @@ impl Default for PredictionEngine {
 }
 
 impl PredictionEngine {
-    /// Construct a cold predictor with an unknown terminal model.
     #[must_use]
     pub fn new() -> Self {
         Self::with_max_pending(DEFAULT_MAX_PENDING)
     }
 
-    /// Construct a predictor with a custom pending-operation bound.
-    ///
-    /// A zero bound is promoted to one so an undrawn probe remains possible.
+    /// Skips the echo probe and can display input at a silent password prompt.
+    #[must_use]
+    pub fn new_immediate() -> Self {
+        Self::with_mode(DEFAULT_MAX_PENDING, true)
+    }
+
     #[must_use]
     pub fn with_max_pending(max_pending: usize) -> Self {
+        Self::with_mode(max_pending, false)
+    }
+
+    fn with_mode(max_pending: usize, immediate_echo: bool) -> Self {
         Self {
             terminal_trust: TerminalTrust::Unknown,
-            echo_confidence: EchoConfidence::Cold,
+            echo_confidence: if immediate_echo {
+                EchoConfidence::Trusted
+            } else {
+                EchoConfidence::Cold
+            },
+            immediate_echo,
+            submitted: false,
             input_state: InputParseState::Ground,
             pending: VecDeque::new(),
             max_pending: max_pending.max(1),
@@ -264,25 +216,21 @@ impl PredictionEngine {
         }
     }
 
-    /// Current terminal-model trust.
     #[must_use]
     pub fn terminal_trust(&self) -> TerminalTrust {
         self.terminal_trust
     }
 
-    /// Current learned echo confidence.
     #[must_use]
     pub fn echo_confidence(&self) -> EchoConfidence {
         self.echo_confidence
     }
 
-    /// Number of input operations awaiting authoritative confirmation.
     #[must_use]
     pub fn pending_operations(&self) -> usize {
         self.pending.len()
     }
 
-    /// Number of speculative characters currently visible in the overlay.
     #[must_use]
     pub fn visible_predictions(&self) -> usize {
         self.pending
@@ -291,26 +239,28 @@ impl PredictionEngine {
             .count()
     }
 
-    /// Smoothed echo RTT, if at least one operation has been confirmed.
     #[must_use]
     pub fn measured_rtt(&self) -> Option<Duration> {
         self.measured_rtt
     }
 
-    /// Adaptive expiry interval: `max(750 ms, 3 * RTT)`, capped at 3 seconds.
     #[must_use]
     pub fn stale_deadline(&self) -> Duration {
-        self.measured_rtt.map_or(MIN_STALE_DEADLINE, |rtt| {
-            rtt.saturating_mul(3)
-                .clamp(MIN_STALE_DEADLINE, MAX_STALE_DEADLINE)
-        })
+        self.measured_rtt.map_or_else(
+            || {
+                if self.immediate_echo {
+                    MAX_STALE_DEADLINE
+                } else {
+                    MIN_STALE_DEADLINE
+                }
+            },
+            |rtt| {
+                rtt.saturating_mul(3)
+                    .clamp(MIN_STALE_DEADLINE, MAX_STALE_DEADLINE)
+            },
+        )
     }
 
-    /// Update terminal-model trust.
-    ///
-    /// Becoming safe does not implicitly re-arm prediction. The shadow terminal
-    /// must separately call [`Self::rearm_at_safe_anchor`] after verifying the
-    /// cursor and underlying cells.
     pub fn set_terminal_trust(&mut self, trust: TerminalTrust) -> Option<ResetEffect> {
         if self.terminal_trust == trust {
             return None;
@@ -324,12 +274,6 @@ impl PredictionEngine {
         }
     }
 
-    /// Re-arm prediction after the shadow terminal verifies a safe anchor.
-    ///
-    /// Re-arming is refused in the middle of an escape sequence or bracketed
-    /// paste, or while old operations still await confirmation. An already
-    /// trusted echo epoch remains trusted; ordinary authoritative echoes must
-    /// not turn every following key back into an undrawn probe.
     pub fn rearm_at_safe_anchor(&mut self) -> bool {
         if self.terminal_trust != TerminalTrust::Safe
             || !self.input_state.is_ground()
@@ -339,19 +283,35 @@ impl PredictionEngine {
         }
 
         if self.echo_confidence == EchoConfidence::Quarantined {
-            self.echo_confidence = EchoConfidence::Cold;
+            self.echo_confidence = if self.immediate_echo {
+                EchoConfidence::Trusted
+            } else {
+                EchoConfidence::Cold
+            };
         }
         true
     }
 
-    /// Observe one raw input byte without consuming or transforming it.
-    ///
-    /// The caller must forward `byte` regardless of the returned effect.
     pub fn observe_input(&mut self, byte: u8, now: Instant) -> InputDecision {
         let class = self.classify_input(byte);
+        if self.submitted {
+            return InputDecision {
+                class,
+                effect: InputEffect::ForwardOnly,
+            };
+        }
         let effect = match class {
             InputClass::SafePrintable(printable) => self.observe_printable(printable, now),
             InputClass::Backspace(_) => self.observe_backspace(now),
+            InputClass::Barrier(InputBarrier::Control(0x0a | 0x0d))
+                if self.immediate_echo
+                    && self.terminal_trust == TerminalTrust::Safe
+                    && self.echo_confidence == EchoConfidence::Trusted
+                    && self.visible_predictions() != 0 =>
+            {
+                self.submitted = true;
+                InputEffect::Submit
+            }
             InputClass::Barrier(_) => {
                 if self.echo_confidence == EchoConfidence::Quarantined && self.pending.is_empty() {
                     InputEffect::ForwardOnly
@@ -364,7 +324,6 @@ impl PredictionEngine {
         InputDecision { class, effect }
     }
 
-    /// Return the next operation the shadow terminal may confirm.
     #[must_use]
     pub fn expected_echo(&self) -> Option<ExpectedEcho> {
         self.pending.front().map(|operation| match operation {
@@ -376,10 +335,6 @@ impl PredictionEngine {
         })
     }
 
-    /// Reconcile one operation recognized in authoritative terminal output.
-    ///
-    /// Call this only after the shadow model establishes that the output occurred
-    /// at the expected anchor. Ordinary unrelated remote bytes are not mismatches.
     pub fn confirm_echo(
         &mut self,
         confirmation: EchoConfirmation,
@@ -445,13 +400,15 @@ impl PredictionEngine {
         }
     }
 
-    /// Suspend prediction because authoritative output invalidated the anchor.
     pub fn authoritative_change(&mut self) -> ResetEffect {
         self.suspend(ResetReason::AuthoritativeChange)
     }
 
-    /// Expire pending prediction state when its oldest operation becomes stale.
     pub fn expire_stale(&mut self, now: Instant) -> Option<ResetEffect> {
+        // Expiring immediate predictions would manufacture a backward cursor jump.
+        if self.immediate_echo {
+            return None;
+        }
         let sent_at = self.pending.front().map(PendingOperation::sent_at)?;
         let elapsed = now.checked_duration_since(sent_at).unwrap_or_default();
 
@@ -579,6 +536,7 @@ impl PredictionEngine {
     fn suspend(&mut self, reason: ResetReason) -> ResetEffect {
         let rollback_chars = self.visible_predictions();
         self.clear_pending();
+        self.submitted = false;
         self.echo_confidence = EchoConfidence::Quarantined;
         ResetEffect {
             rollback_chars,
@@ -811,6 +769,53 @@ mod tests {
     }
 
     #[test]
+    fn immediate_mode_draws_the_first_character_and_rearms_without_a_probe() {
+        let mut engine = PredictionEngine::new_immediate();
+        let now = Instant::now();
+
+        assert_eq!(engine.set_terminal_trust(TerminalTrust::Safe), None);
+        assert!(engine.rearm_at_safe_anchor());
+        assert_eq!(
+            engine.observe_input(b'x', now).effect,
+            InputEffect::DrawAppend { byte: b'x' }
+        );
+
+        let _ = engine.authoritative_change();
+        assert_eq!(engine.echo_confidence(), EchoConfidence::Quarantined);
+        assert!(engine.rearm_at_safe_anchor());
+        assert_eq!(engine.echo_confidence(), EchoConfidence::Trusted);
+        assert_eq!(
+            engine
+                .observe_input(b'y', now + Duration::from_millis(1))
+                .effect,
+            InputEffect::DrawAppend { byte: b'y' }
+        );
+    }
+
+    #[test]
+    fn immediate_submit_keeps_predictions_visible_until_remote_output() {
+        let mut engine = PredictionEngine::new_immediate();
+        let now = Instant::now();
+        assert_eq!(engine.set_terminal_trust(TerminalTrust::Safe), None);
+        assert!(engine.rearm_at_safe_anchor());
+
+        assert!(matches!(
+            engine.observe_input(b'x', now).effect,
+            InputEffect::DrawAppend { byte: b'x' }
+        ));
+        assert_eq!(engine.observe_input(b'\r', now).effect, InputEffect::Submit);
+        assert_eq!(engine.visible_predictions(), 1);
+        assert_eq!(
+            engine.observe_input(b'y', now).effect,
+            InputEffect::ForwardOnly
+        );
+
+        let reset = engine.authoritative_change();
+        assert_eq!(reset.rollback_chars, 1);
+        assert_eq!(engine.visible_predictions(), 0);
+    }
+
+    #[test]
     fn first_character_is_an_undrawn_probe_then_trusts_matching_echo() {
         let (mut engine, start) = safe_engine();
         let decision = engine.observe_input(b'x', start);
@@ -886,7 +891,6 @@ mod tests {
             })
         );
 
-        // A later key cannot be drawn over the still-undrawn `b` column.
         assert_eq!(
             engine
                 .observe_input(b'c', start + Duration::from_millis(51))
@@ -1186,6 +1190,25 @@ mod tests {
             })
         );
         assert_eq!(engine.echo_confidence(), EchoConfidence::Quarantined);
+    }
+
+    #[test]
+    fn immediate_mode_never_expires_a_locally_composed_cursor() {
+        let mut engine = PredictionEngine::new_immediate();
+        let start = Instant::now();
+        engine.set_terminal_trust(TerminalTrust::Safe);
+        assert!(engine.rearm_at_safe_anchor());
+        assert_eq!(engine.stale_deadline(), Duration::from_secs(3));
+
+        engine.observe_input(b'a', start);
+        assert_eq!(engine.expire_stale(start + Duration::from_secs(30)), None);
+        assert_eq!(engine.visible_predictions(), 1);
+        assert_eq!(
+            engine.observe_input(b'\r', start).effect,
+            InputEffect::Submit
+        );
+        assert_eq!(engine.expire_stale(start + Duration::from_secs(300)), None);
+        assert_eq!(engine.visible_predictions(), 1);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub fn crush_command() -> Command {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("LC_ALL", "C")
+        .env("CRUSH_TRANSPORT", "ssh")
         .env("TERM", "xterm-256color");
     command
 }

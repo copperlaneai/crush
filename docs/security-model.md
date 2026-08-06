@@ -1,161 +1,157 @@
 # Security model
 
-Crush is a local terminal and process wrapper. Its primary security goal is to
-preserve OpenSSH's boundary while ensuring that latency optimizations cannot
-expose secret input or change the byte stream.
+Crush uses OpenSSH as its authentication and trust bootstrap. The mobile
+transport adds a remote helper, encrypted UDP protocol, terminal emulator, and
+local predictor to the attack surface.
 
-## Trusted components
+## Trust boundaries
 
-- The user-selected OpenSSH executable is trusted for SSH protocol security,
-  authentication, configuration, host verification, encryption, and transport.
-- The local operating system, terminal emulator, shell environment, and user
-  account are trusted to the same degree as they are for plain SSH.
-- Release users trust GitHub's release infrastructure and, when signature
-  verification is used, the Sigstore identity bound to the release workflow.
+- The selected OpenSSH executable is trusted for configuration, host identity,
+  authentication, and the confidentiality/integrity of bootstrap data.
+- The local operating system, terminal, account, and Crush binary are trusted.
+- `crush --server` runs on the authenticated remote account. A compromised
+  remote account can already observe or alter its shell and terminal contents.
+- Network peers, unauthenticated UDP packets, and terminal/application output
+  are untrusted.
 
-The remote host and every byte it emits are untrusted. Crush does not sanitize
-terminal control sequences; doing so would break byte transparency. Users must
-apply the same caution to untrusted remote output that they apply under SSH.
+Crush does not make an untrusted remote shell safe. Screen cells, titles, and
+terminal effects originate on that host and have the same general trust level
+as output shown through SSH.
 
-## Protected assets
+## Session bootstrap and UDP protection
 
-- Keystrokes, especially passwords and other input entered while remote echo is
-  disabled.
-- SSH arguments, hostnames, configuration paths, and environment.
-- Terminal contents, clipboard transfers, query replies, and application data.
-- Local terminal settings and process control state.
-- The exact input/output order and OpenSSH exit result.
+The helper generates a fresh 256-bit random key and returns it through the
+authenticated SSH channel with its selected UDP port. The predictable default
+port range is not a credential; the key is never sent in UDP.
 
-## Threats and controls
+Each datagram is independently protected with ChaCha20-Poly1305. Its marker,
+kind, sequence, and fragment coordinates are authenticated as associated data.
+Packet kinds separate nonce spaces; retransmissions reuse a nonce only for the
+same immutable packet. Authentication failure is discarded before parsing any
+payload as input or screen state.
 
-### Secret speculative echo
+Sequence numbers provide input ordering and deduplication. The server accepts a
+bounded future window and ignores already-applied input. Frame fragments and
+advertised dimensions have explicit limits. The client retains only a few
+recent assemblies, limiting unauthenticated and authenticated memory pressure.
 
-A predictor could display password input before learning that remote echo is
-disabled. Crush starts each epoch with an undrawn probe and predicts only after
-an exact remote echo proves a safe linear context. Mode changes, Enter, Escape,
-control input, cursor movement, contradiction, or timeout reset that confidence,
-so ordinary password prompts begin cold and remain undrawn.
+A correctly authenticated packet may update the client's source address. This
+enables roaming and also means possession of the session key is sufficient to
+redirect the remote endpoint. The key is therefore treated like a session
+credential and held in zeroizing storage where practical.
 
-A client-only wrapper cannot observe a remote application which disables echo
-silently, without a prompt, barrier, cursor change, or other output after a
-previously trusted echo. In that unusual transition, a printable character can
-appear speculatively until authoritative output disagrees or the prediction
-expires. Use `CRUSH_PREDICT=off` when entering secrets into an application with
-that behavior. An authenticated remote helper carrying termios/echo state would
-be required for an absolute guarantee across silent transitions.
+The current protocol does not provide forward secrecy independent of the
+SSH-delivered session key, multi-party attachment, or recovery after key/process
+loss.
 
-Unresolved input is held only as long as needed for comparison. Pending input,
-prediction observer events, stack read buffers, renderer frames, and overlay
-capacity use best-effort zeroization on reset and drop. With prediction off,
-trace-only input observations contain counts and timing metadata rather than a
-copy of the input bytes.
+## Speculative input and secrets
 
-### Terminal-protocol confusion
+Local prediction can reveal a character on the physical screen before the
+remote application displays it.
 
-Incomplete or unfamiliar CSI/OSC/DCS sequences can desynchronize a partial
-emulator. Parsing is incremental across arbitrary read boundaries. The relay
-does not depend on parser results, and the overlay is disabled unless the parser
-is in a known ground state with a safe cursor and underlying cells. At initial
-application entry, Crush assumes only conventional VT mode and ASCII-charset
-defaults already required by tmux; it sends no normalization bytes. The initial
-screen, cursor, and rendition are explicitly unknown, so cursor movement alone
-cannot turn synthetic shadow defaults into safe overlay targets. A shadow
-recreated after skipped output or suspend/resume assumes nothing, including
-whether the terminal is using ANSI, VT52, or Tektronix parsing. Because foreign
-grammars can ignore or reinterpret bare RIS, parser trust recovers from an
-unknown state only after observed Tektronix and VT52 exits (`ESC ETX`, `ESC <`)
-and a following RIS. Both exits remain necessary after a specific switch because
-optional terminal features may ignore that switch and leave a different grammar
-possible. Incomplete UTF-8, opaque DCS/APC, unknown display modes, and unknown
-OSC protocols taint or invalidate the model until an authoritative convergence
-sequence. A full-screen erase proves default blank cells only when default
-rendition was already known; a reset emitted after the erase does not reclassify
-those earlier cells.
+Kernel `ECHO` is not a reliable secret signal: zsh line editing, tmux, and TUIs
+all disable it while drawing ordinary input themselves. Crush permits
+prediction in both primary- and alternate-screen line editors unless the
+current input row contains a common `password`, `passphrase`, `secret`, `token`,
+or `login:` shape.
 
-Crush never fabricates DA, DSR, color, clipboard, or keyboard-protocol replies.
-Remote queries reach the physical terminal and terminal replies reach OpenSSH.
+This handles normal password prompts and preserves tmux/coding-agent latency,
+but it is a heuristic for nested applications. A disguised or blank secret
+prompt inside a full-screen program can still receive a temporary local echo.
+Use `CRUSH_PREDICT=off` before unusual secret-entry workflows. Prediction-off
+still uses state synchronization and does not slow input delivery.
 
-### Input interception or transformation
+Bracketed-paste contents, ambiguous controls, unsupported Kitty events, and
+non-ASCII text are not predicted. Simple left/right cursor motion is predicted
+conditionally. Pending printable text is not logged by the metadata trace.
 
-Semantic input libraries can combine, normalize, or discard bytes. Crush relays
-raw bytes before sending a best-effort observation to prediction. It reserves no
-key, performs no line-ending normalization, and preserves paste delimiters,
-focus/mouse events, extended keys, and tmux prefixes.
+## Screen protocol and terminal effects
 
-### Output starvation and memory exhaustion
+The helper parses PTY output into a bounded visible framebuffer. The client
+validates dimensions, codepoints, compressed size, fragment counts, cursor
+coordinates, and exact payload length before rendering. It generates its own
+bounded cursor/style sequences instead of forwarding arbitrary network bytes as
+terminal controls.
 
-Remote output can be arbitrarily fast. Input has an independent relay path;
-physical output, prediction, shadow parsing, and trace queues are bounded.
-During a running relay, authoritative output is never dropped: PTY reads pause
-at the output high-water mark until the physical terminal drains.
-Provenance-tagged queue segments let resize and lifecycle cleanup discard only
-stale synthetic suffixes without reordering retained authoritative bytes.
-Observer work is time-sliced or moved to a drop-on-full worker; observer
-overflow disables prediction instead of blocking the relay or growing memory
-without limit.
+Titles and bells remain remote-controlled terminal effects. Control bytes are
+removed from title text before producing OSC title output. Clipboard and color
+queries are answered by the helper with constrained values; arbitrary remote
+clipboard payload synchronization is not implemented in the first protocol.
 
-### Process and terminal lifecycle failures
+The legacy SSH relay intentionally remains byte-transparent and therefore has
+the same terminal-escape exposure as plain SSH.
 
-Errors or signals could leave the user's terminal raw or spawn SSH with an unsafe
-descriptor layout. PTY and terminal ownership use scoped guards. Process creation
-keeps pre-exec work minimal, starts threads only afterward, closes unintended
-descriptors, and forwards window size. Scoped drops cover unwind paths;
-automated PTY tests exercise restoration across normal exit, launch errors,
-signals, stop/resume, PTY hangup, and input/output backpressure.
+## Overwrite prediction integrity
 
-Lifecycle signal handling pauses the input relay and stops PTY reads before
-settling a visible overlay. If stdout accepts output within the 100 ms handoff
-deadline, Crush completes the exact applied frame prefix and its matching erase
-before restoring terminal ownership. A permanently unwritable terminal makes
-both exact visual cleanup and bounded handoff impossible; Crush chooses bounded
-termios/file-flag restoration, abandons only unwritten synthetic bytes, and may
-leave a transient plain-text residue. A resize never erases at stale coordinates
-and instead relies on the authoritative application redraw. Process termination
-can necessarily leave an unwritable authoritative tail undisplayed, just as any
-terminal process can when its output device stops accepting bytes.
+Speculative cells are never written back to the authoritative framebuffer. The
+client clones the newest remote state, applies absolute cell replacements to
+that candidate, and computes one minimal diff from the previously displayed
+candidate. It never emits an insert-character operation or copies the remainder
+of a row. An unrelated remote redraw therefore cannot erase and repaint the
+prediction row.
 
-### Executable confusion
+Transport receipt and screen validation use separate acknowledgements. A key is
+not judged merely because it reached the PTY; a delayed echo acknowledgement
+makes the resulting screen eligible for conditional confirmation or correction.
+Predictions never become remote input beyond the original exact bytes sent.
 
-`CRUSH_SSH` can intentionally select a binary; otherwise resolution follows the
-user's `PATH`. Crush rejects a resolution that points back to itself. Users must
-protect `PATH` and `CRUSH_SSH` as they protect SSH aliases and shell startup
-files.
+## Process and terminal lifecycle
 
-The installer has an additional name-confusion risk because another popular
-program is also named `crush`. It never executes a preexisting destination to
-identify it. Every existing target, including an older Crush installation, is
-refused unless the user supplies `--force`; directories are always refused.
+The helper PTY and local physical terminal use scoped descriptors and termios
+guards. Controlled client exit resets cursor, mouse, focus, paste,
+alternate-screen, application-key, and Kitty keyboard modes before restoring
+the original terminal settings. The helper sends SIGHUP to its owned shell
+process group on abnormal teardown.
 
-### Diagnostics disclosure
+The SSH bootstrap remains a lifecycle parent in this version. Closing the local
+client terminates that bootstrap and helper. A helper with no authenticated
+client packet for ten minutes exits rather than retaining an unbounded orphan.
 
-There is no telemetry. `CRUSH_TRACE` is explicit and local. Its destination must
-be a regular file owned by the current user with no group/other permissions;
-symlinks, FIFOs, devices, foreign owners, and broadly readable existing files
-are rejected. Trace schemas permit only timings, counters, state transitions, queue
-pressure, prediction rollback categories, and outcomes. They prohibit argv,
-environment values, hostnames, input content, terminal payloads, query replies,
-and clipboard data.
-Trace delivery is best effort and a file may omit its final queued events; the
-relay never waits for diagnostic I/O.
+Crush installs signal flags for termination and resize. Job-control suspend and
+resume for the mobile path require additional hardening before 1.0; the SSH
+fallback retains its more complete process-group lifecycle implementation.
 
-### Release substitution
+## Availability and resource exhaustion
 
-Release archives, `SHA256SUMS`, SBOMs, and installer source are published from a
-tagged workflow. Archives receive GitHub build-provenance attestations and
-Sigstore keyless bundles. The installer checks SHA-256 and, when Cosign is
-available, authenticates the checksum manifest to the exact repository workflow
-identity. Users who require publisher authentication should perform the manual
-verification in [releasing.md](releasing.md#verify-a-release) before execution.
+Remote output can change continuously. The server sends bounded-rate latest
+state, expands its interval when acknowledgements lag, and retries the latest
+state. It does not queue every application frame. Input has its own packets and
+retransmission queue, so output congestion does not place input behind screen
+bytes.
+
+Authenticated peers can still consume CPU by producing high-entropy full-screen
+changes, forcing compression and fragmentation. Visible cells, fragments,
+assemblies, reordered input, and pending input all have fixed limits. These are
+session availability controls, not protection against a compromised remote
+account exhausting its own resources.
+
+## Configuration and executable confusion
+
+`CRUSH_SSH` and `CRUSH_SERVER` intentionally select executables. Protect them,
+`PATH`, shell startup files, and SSH configuration as credentials. Local Crush
+rejects `CRUSH_SSH` resolving back to itself. The remote helper command is
+interpreted by the SSH remote shell; paths containing shell metacharacters must
+be treated as shell input and should be avoided.
+
+Another popular application also uses the executable name `crush`. The
+installer refuses every existing destination unless `--force` is explicit and
+never executes an existing file to identify it.
+
+## Diagnostics
+
+There is no telemetry. `CRUSH_TRACE` is local and opt-in. The destination must
+be a regular, user-owned, non-symlink file inaccessible to group/other users.
+Mobile trace events contain frame numbers, compressed sizes, byte counts, and
+local paint latency—not hostnames, keys, packet payloads, terminal cells, or
+keystrokes.
 
 ## Out of scope
 
-- Compromise of OpenSSH, the operating system, local terminal, shell, account,
-  remote host, GitHub account, or Sigstore infrastructure.
-- Harmful terminal escape sequences emitted by an untrusted server; plain SSH
-  exposes the terminal to the same bytes.
-- Traffic analysis, endpoint compromise, or secrets already present in process
-  arguments/environment outside Crush.
-- Guarantees for an unsupported build, modified binary, or overridden SSH
-  executable.
+- Compromise of OpenSSH, an endpoint OS/account, terminal, shell, release
+  account, or distribution infrastructure.
+- Traffic analysis and endpoint metadata leakage.
+- Perfect secret-prompt detection inside arbitrary nested full-screen apps.
+- Harm caused by content the authenticated remote account is already authorized
+  to display or execute.
 
-Report suspected vulnerabilities according to [SECURITY.md](../SECURITY.md).
+Report vulnerabilities according to [SECURITY.md](../SECURITY.md).

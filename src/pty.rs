@@ -126,6 +126,10 @@ impl io::Write for PhysicalOutput {
     fn flush(&mut self) -> io::Result<()> {
         io::Write::flush(&mut self.file)
     }
+
+    fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        io::Write::write_vectored(&mut self.file, buffers)
+    }
 }
 
 impl Drop for PhysicalOutput {

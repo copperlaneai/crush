@@ -38,6 +38,20 @@ fn version_action_is_local_and_exact() {
 }
 
 #[test]
+fn conventional_long_version_flag_is_local() {
+    let output = crush_command()
+        .arg("--version")
+        .output()
+        .expect("run crush --version");
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        format!("crush {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn doctor_uses_ssh_version_and_strips_private_environment() {
     let temp = TempDir::new("doctor");
     let fake_ssh = temp.executable(
@@ -206,7 +220,7 @@ fn invalid_configuration_exits_two_and_names_the_variable() {
     let cases = [
         ("CRUSH_SSH", "", "a non-empty executable name or path"),
         ("CRUSH_MODE", "fast", "one of: auto, passthrough, force"),
-        ("CRUSH_PREDICT", "on", "one of: auto, off"),
+        ("CRUSH_PREDICT", "on", "one of: auto, fast, off"),
         ("CRUSH_TRACE", "", "a non-empty file path"),
         ("CRUSH_ACTION", "help", "one of: version, doctor"),
     ];
@@ -384,24 +398,30 @@ done
 "#,
     );
 
-    // These boundaries exercise single-byte controls, partial parameters,
-    // terminators split from their strings, and a larger relay read.
-    for chunk_size in [1_usize, 2, 3, 7, 31, 4_096] {
-        let block_count = transcript.len().div_ceil(chunk_size);
-        let mut command = crush_command();
-        command
-            .env("CRUSH_SSH", &fake_ssh)
-            .env("CRUSH_MODE", "force")
-            .env("CRUSH_PREDICT", "off")
-            .env("TEST_TRANSCRIPT", &transcript_file)
-            .env("TEST_CHUNK", chunk_size.to_string())
-            .env("TEST_BLOCK_COUNT", block_count.to_string())
-            .arg("user@example.test");
+    for prediction in ["off", "fast"] {
+        for chunk_size in [1_usize, 2, 3, 7, 31, 4_096] {
+            let block_count = transcript.len().div_ceil(chunk_size);
+            let mut command = crush_command();
+            command
+                .env("CRUSH_SSH", &fake_ssh)
+                .env("CRUSH_MODE", "force")
+                .env("CRUSH_PREDICT", prediction)
+                .env("TEST_TRANSCRIPT", &transcript_file)
+                .env("TEST_CHUNK", chunk_size.to_string())
+                .env("TEST_BLOCK_COUNT", block_count.to_string())
+                .arg("user@example.test");
 
-        let run = PtyRun::spawn(command, None);
-        let (status, output) = run.finish();
-        assert!(status.success(), "chunk_size={chunk_size}, status={status}");
-        assert_eq!(output, transcript, "chunk_size={chunk_size}");
+            let run = PtyRun::spawn(command, None);
+            let (status, output) = run.finish();
+            assert!(
+                status.success(),
+                "prediction={prediction}, chunk_size={chunk_size}, status={status}"
+            );
+            assert_eq!(
+                output, transcript,
+                "prediction={prediction}, chunk_size={chunk_size}"
+            );
+        }
     }
 }
 
@@ -426,7 +446,7 @@ printf '\rCRUSH_DONE'
     command
         .env("CRUSH_SSH", fake_ssh)
         .env("CRUSH_MODE", "force")
-        .env("CRUSH_PREDICT", "auto")
+        .env("CRUSH_PREDICT", "fast")
         .env("TEST_INPUT_FILE", &input_file)
         .env("TEST_INPUT_LEN", input.len().to_string())
         .arg("user@example.test");
@@ -443,6 +463,569 @@ printf '\rCRUSH_DONE'
         fs::read(input_file).expect("read fake SSH input recording"),
         input
     );
+}
+
+#[test]
+fn fast_prediction_advances_smoothly_before_a_delayed_echo() {
+    const READY: &[u8] = b"remote$ ";
+    const INPUT: &[u8] = b"crush\r";
+    const OVERLAY: &[u8] = b"crush";
+
+    let temp = TempDir::new("fast-first-burst");
+    let input_file = temp.file("input.bin");
+    let input_received = temp.file("input-received");
+    let trace_file = temp.file("trace.jsonl");
+    let fake_ssh = temp.executable(
+        "fast-echo-ssh",
+        r#"#!/bin/sh
+stty raw -echo
+printf 'remote$ '
+dd of="$TEST_INPUT_FILE" bs=1 count="$TEST_INPUT_LEN" 2>/dev/null
+: > "$TEST_INPUT_RECEIVED"
+sleep 1
+cat "$TEST_INPUT_FILE"
+"#,
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", fake_ssh)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env("TEST_INPUT_FILE", &input_file)
+        .env("TEST_INPUT_LEN", INPUT.len().to_string())
+        .env("TEST_INPUT_RECEIVED", &input_received)
+        .env("CRUSH_TRACE", &trace_file)
+        .arg("user@example.test");
+
+    let mut run = PtyRun::spawn(command, Some(READY));
+    run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
+    let typed_at = Instant::now();
+    let mut incremental_overlay = Vec::new();
+    for (index, &byte) in OVERLAY.iter().enumerate() {
+        run.write_input(&[byte]);
+        let frame = [b"\x1b[2m".as_slice(), &[byte], b"\x1b[22m"].concat();
+        wait_for_output(&run, &frame);
+        let cell_column = 9 + index;
+        let cursor_column = cell_column + 1;
+        incremental_overlay.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+        incremental_overlay.extend_from_slice(format!("\x1b[1;{cell_column}H").as_bytes());
+        incremental_overlay.extend_from_slice(&frame);
+        incremental_overlay.extend_from_slice(
+            format!("\x1b[1;{cursor_column}H\x1b[7m \x1b[27m\x1b[1;{cursor_column}H\x1b[?2026l")
+                .as_bytes(),
+        );
+    }
+    let local_echo_latency = typed_at.elapsed();
+    run.write_input(b"\r");
+    wait_for_file(&input_received);
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_rendered\"");
+    let render_latency_us = trace_value(&trace_file, "prediction_rendered", "latency_us")
+        .expect("prediction trace includes render latency");
+    let output_before_remote_echo = run.output_snapshot();
+    let (status, output) = run.finish();
+
+    assert!(status.success(), "status={status}, output={output:?}");
+    assert_eq!(fs::read(input_file).expect("read fake SSH input"), INPUT);
+    assert!(
+        local_echo_latency < Duration::from_millis(250),
+        "first-burst local echo took {local_echo_latency:?}"
+    );
+    assert!(
+        render_latency_us < 50_000,
+        "input-read to physical-render latency was {render_latency_us} us"
+    );
+    eprintln!("fast local echo: {render_latency_us} us versus 1,000,000 us authoritative delay");
+    assert_eq!(
+        output_before_remote_echo,
+        [READY, incremental_overlay.as_slice()].concat(),
+        "ordinary typing must never rewind and repaint the predicted prefix"
+    );
+
+    let catch_up = [
+        b"\x1b[?2026h".as_slice(),
+        INPUT,
+        b"\x1b[1;14H \x1b[1;1H\x1b[?25h\x1b[?2026l".as_slice(),
+    ]
+    .concat();
+    assert_eq!(
+        output,
+        [READY, &incremental_overlay, &catch_up].concat(),
+        "echo, old software-cell restoration, and final CR cursor must paint atomically"
+    );
+}
+
+#[test]
+fn fast_prediction_replaces_a_coding_agent_placeholder_on_the_first_key() {
+    const READY: &[u8] = b"\x1b[?2026l";
+    const LOCAL_OVERLAY: &[u8] = b"\x1b[?2026h\x1b[?25l\x1b[10;3H\x1b[2mx\x1b[22m\x1b[10;4H\x1b[2;7mx\x1b[22;27m\x1b[10;4H\x1b[?2026l";
+    const DIRECT_AUTHORITATIVE_REDRAW: &[u8] = b"\x1b[?2026h\x1b[10;3Hx";
+
+    let temp = TempDir::new("coding-agent-placeholder");
+    let input_file = temp.file("input.bin");
+    let input_received = temp.file("input-received");
+    let trace_file = temp.file("trace.jsonl");
+    let fake_ssh = temp.executable(
+        "coding-agent-ssh",
+        r#"#!/bin/sh
+stty raw -echo
+printf '\033[?2026h\033[2J\033[H\033[10;1H\033[1m\342\200\272\033[22m\033[10;3H\033[2mExplain this codebase\033[22m\033[?25h\033[10;3H\033[?2026l'
+dd of="$TEST_INPUT_FILE" bs=1 count=1 2>/dev/null
+: > "$TEST_INPUT_RECEIVED"
+sleep 1
+printf '\033[?2026h\033[10;3Hx\033[?2026l'
+"#,
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", fake_ssh)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env("TEST_INPUT_FILE", &input_file)
+        .env("TEST_INPUT_RECEIVED", &input_received)
+        .env("CRUSH_TRACE", &trace_file)
+        .arg("user@example.test");
+
+    let mut run = PtyRun::spawn(command, Some(READY));
+    run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
+    run.write_input(b"x");
+    wait_for_file(&input_received);
+    wait_for_output(&run, LOCAL_OVERLAY);
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_rendered\"");
+    let output_before_remote_redraw = run.output_snapshot();
+    let (status, output) = run.finish();
+
+    assert!(status.success(), "status={status}, output={output:?}");
+    assert_eq!(fs::read(input_file).expect("read coding-agent input"), b"x");
+    assert!(
+        output_before_remote_redraw.ends_with(LOCAL_OVERLAY),
+        "the first key must replace the placeholder before remote output: {output_before_remote_redraw:?}"
+    );
+    assert!(
+        find_subslice(&output, DIRECT_AUTHORITATIVE_REDRAW).is_some(),
+        "the authoritative frame must directly replace the local prediction: {output:?}"
+    );
+    let after_overlay = find_subslice(&output, LOCAL_OVERLAY)
+        .expect("final output contains the local coding-agent overlay")
+        + LOCAL_OVERLAY.len();
+    assert!(
+        max_consecutive_byte(&output[after_overlay..], b'\x08') == 0,
+        "a coding-agent redraw must not perform any relative cursor rewind: {output:?}"
+    );
+    assert!(
+        !fs::read_to_string(trace_file)
+            .expect("read coding-agent trace")
+            .contains("\"event\":\"prediction_blocked\""),
+        "the dim placeholder should not block first-key prediction"
+    );
+}
+
+#[test]
+fn fast_prediction_survives_unrelated_coding_agent_redraws() {
+    const READY: &[u8] = b"\x1b[?2026l";
+    const LOCAL_OVERLAY: &[u8] = b"\x1b[?2026h\x1b[?25l\x1b[10;3H\x1b[2mx\x1b[22m\x1b[10;4H\x1b[2;7mx\x1b[22;27m\x1b[10;4H\x1b[?2026l";
+    const RECOMPOSED_OVERLAY: &[u8] =
+        b"\x1b[10;3H\x1b[?25l\x1b[10;3H\x1b[2mx\x1b[22m\x1b[10;4H\x1b[2;7mx\x1b[22;27m\x1b[10;4H\x1b[?2026l";
+
+    let temp = TempDir::new("coding-agent-streaming-overlay");
+    let input_file = temp.file("input.bin");
+    let status_sent = temp.file("status-sent");
+    let trace_file = temp.file("trace.jsonl");
+    let fake_ssh = temp.executable(
+        "streaming-coding-agent-ssh",
+        r#"#!/bin/sh
+stty raw -echo
+printf '\033[?2026h\033[2J\033[H\033[10;1H\033[1m\342\200\272\033[22m\033[10;3H\033[2mExplain this codebase\033[22m\033[?25h\033[10;3H\033[?2026l'
+dd of="$TEST_INPUT_FILE" bs=1 count=1 2>/dev/null
+sleep 0.1
+printf '\033[?2026h\033[5;1H\033[2mThinking...\033[22m\033[10;3H\033[?20'
+sleep 0.005
+printf '26l'
+: > "$TEST_STATUS_SENT"
+sleep 0.8
+printf '\033[?2026h\033[10;3Hx\033[?2026l'
+"#,
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", fake_ssh)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env("TEST_INPUT_FILE", &input_file)
+        .env("TEST_STATUS_SENT", &status_sent)
+        .env("CRUSH_TRACE", &trace_file)
+        .arg("user@example.test");
+
+    let mut run = PtyRun::spawn(command, Some(READY));
+    run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
+    run.write_input(b"x");
+    wait_for_output(&run, LOCAL_OVERLAY);
+    wait_for_file(&status_sent);
+    wait_for_output(&run, RECOMPOSED_OVERLAY);
+    wait_for_file_contents(&trace_file, b"\"event\":\"tui_frame_composed\"");
+    wait_for_file_contents(&trace_file, b"\"event\":\"tui_frame_coalesced\"");
+    let output_during_delayed_echo = run.output_snapshot();
+    let (status, output) = run.finish();
+
+    assert!(status.success(), "status={status}, output={output:?}");
+    assert_eq!(fs::read(input_file).expect("read coding-agent input"), b"x");
+    assert!(
+        output_during_delayed_echo.ends_with(RECOMPOSED_OVERLAY),
+        "unrelated redraw must leave the local character and cursor composed on top: {output_during_delayed_echo:?}"
+    );
+    let after_overlay = find_subslice(&output, LOCAL_OVERLAY)
+        .expect("final output contains the local coding-agent overlay")
+        + LOCAL_OVERLAY.len();
+    assert!(
+        max_consecutive_byte(&output[after_overlay..], b'\x08') == 0,
+        "streaming redraws must not introduce any relative cursor rewind: {output:?}"
+    );
+}
+
+#[test]
+fn fast_prediction_composes_a_carriage_return_redraw() {
+    const READY: &[u8] = b"\x1b[?2026l";
+    const LOCAL_OVERLAY: &[u8] = b"\x1b[?2026h\x1b[?25l\x1b[10;3H\x1b[2mx\x1b[22m\x1b[10;4H\x1b[2;7mx\x1b[22;27m\x1b[10;4H\x1b[?2026l";
+    const RECOMPOSED: &[u8] =
+        b"\x1b[?2026h\r> \x1b[?25l\x1b[10;3H\x1b[2mx\x1b[22m\x1b[10;4H\x1b[2;7mx\x1b[22;27m\x1b[10;4H\x1b[?2026l";
+
+    let temp = TempDir::new("carriage-return-redraw");
+    let input_file = temp.file("input.bin");
+    let trace_file = temp.file("trace.jsonl");
+    let fake_ssh = temp.executable(
+        "carriage-return-redraw-ssh",
+        r#"#!/bin/sh
+stty raw -echo
+printf '\033[?2026h\033[2J\033[H\033[10;1H\033[1m\342\200\272\033[22m\033[10;3H\033[2mExplain this codebase\033[22m\033[?25h\033[10;3H\033[?2026l'
+dd of="$TEST_INPUT_FILE" bs=1 count=1 2>/dev/null
+sleep 0.05
+printf '\r> '
+sleep 0.1
+printf 'x'
+"#,
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", fake_ssh)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env("TEST_INPUT_FILE", &input_file)
+        .env("CRUSH_TRACE", &trace_file)
+        .arg("user@example.test");
+
+    let mut run = PtyRun::spawn(command, Some(READY));
+    run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
+    run.write_input(b"x");
+    wait_for_output(&run, LOCAL_OVERLAY);
+    wait_for_output(&run, RECOMPOSED);
+    let (status, output) = run.finish();
+
+    assert!(status.success(), "status={status}, output={output:?}");
+    assert_eq!(fs::read(input_file).expect("read redraw input"), b"x");
+    assert!(
+        find_subslice(&output, RECOMPOSED).is_some(),
+        "output={output:?}"
+    );
+    let trace = fs::read_to_string(trace_file).expect("read redraw trace");
+    assert!(
+        trace.contains("\"event\":\"tui_frame_composed\""),
+        "{trace}"
+    );
+    assert!(!trace.contains("\"event\":\"prediction_stale\""), "{trace}");
+}
+
+#[test]
+fn fast_prediction_and_software_cursor_wrap_across_rows() {
+    const READY: &[u8] = b"\x1b[?2026l";
+    const INPUT: &[u8] = b"wrap";
+    const SETTLED: &[u8] =
+        b"\x1b[10;79Hwrap\x1b[11;3H\x1b[2ma\x1b[22m\x1b[11;3H\x1b[?25h\x1b[?2026l";
+
+    let temp = TempDir::new("wrapped-coding-agent-input");
+    let input_file = temp.file("input.bin");
+    let trace_file = temp.file("trace.jsonl");
+    let fake_ssh = temp.executable(
+        "wrapped-coding-agent-ssh",
+        r#"#!/bin/sh
+stty raw -echo
+printf '\033[?2026h\033[2J\033[H\033[10;77H\033[1m\342\200\272\033[22m\033[10;79H\033[2mEx\033[22m\033[11;1H\033[2mplain this codebase\033[22m\033[?25h\033[10;79H\033[?2026l'
+dd of="$TEST_INPUT_FILE" bs=1 count=4 2>/dev/null
+sleep 0.1
+printf '\033[?2026h\033[10;79Hwrap\033[?2026l'
+"#,
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", fake_ssh)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env("TEST_INPUT_FILE", &input_file)
+        .env("CRUSH_TRACE", &trace_file)
+        .arg("user@example.test");
+
+    let mut run = PtyRun::spawn(command, Some(READY));
+    run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
+    for (index, &byte) in INPUT.iter().enumerate() {
+        run.write_input(&[byte]);
+        let linear_column = 78 + index + 1;
+        let row = 10 + linear_column / 80;
+        let column = linear_column % 80 + 1;
+        let cursor_underlay = b"Explain this codebase"[index + 1];
+        let software_cursor = format!(
+            "\x1b[{row};{column}H\x1b[2;7m{}\x1b[22;27m\x1b[{row};{column}H",
+            char::from(cursor_underlay)
+        );
+        wait_for_output(&run, software_cursor.as_bytes());
+    }
+    let before_acknowledgement = run.output_snapshot();
+    wait_for_output(&run, SETTLED);
+    let (status, output) = run.finish();
+
+    assert!(status.success(), "status={status}, output={output:?}");
+    assert_eq!(fs::read(input_file).expect("read wrapped input"), INPUT);
+    let first_local = find_subslice(&before_acknowledgement, b"\x1b[?25l")
+        .expect("wrapped input has an immediate first local frame");
+    assert!(
+        find_subslice(&before_acknowledgement[first_local..], b"\x1b[?25h").is_none(),
+        "the native cursor must stay hidden while local input crosses rows"
+    );
+    assert!(
+        find_subslice(&output, SETTLED).is_some(),
+        "output={output:?}"
+    );
+    let trace = fs::read_to_string(trace_file).expect("read wrapped trace");
+    assert_eq!(
+        trace.matches("\"event\":\"prediction_rendered\"").count(),
+        INPUT.len(),
+        "every wrapped key must render immediately: {trace}"
+    );
+    assert!(
+        !trace.contains("\"event\":\"prediction_blocked\""),
+        "{trace}"
+    );
+}
+
+#[test]
+fn fast_prediction_stays_forward_only_during_per_key_agent_redraws() {
+    const READY: &[u8] = b"\x1b[?2026l";
+    const INPUT: &[u8] = b"crushsync";
+    const PLACEHOLDER: &[u8] = b"Explain this codebase";
+
+    let temp = TempDir::new("coding-agent-per-key-redraws");
+    let input_file = temp.file("input.bin");
+    let trace_file = temp.file("trace.jsonl");
+    let fake_ssh = temp.executable(
+        "per-key-coding-agent-ssh",
+        r#"#!/bin/sh
+stty raw -echo
+printf '\033[?2026h\033[2J\033[H\033[10;1H\033[1m\342\200\272\033[22m\033[10;3H\033[2mExplain this codebase\033[22m\033[?25h\033[10;3H\033[?2026l'
+: > "$TEST_INPUT_FILE"
+i=1
+while [ "$i" -le "$TEST_INPUT_LEN" ]; do
+    dd bs=1 count=1 2>/dev/null >> "$TEST_INPUT_FILE"
+    printf '\033[?2026h\033[5;1H\033[2mThinking %s\033[22m\033[10;3H\033[?20' "$i"
+    sleep 0.005
+    printf '26l'
+    i=$((i + 1))
+done
+sleep 0.2
+printf '\033[?2026h\033[10;3H'
+cat "$TEST_INPUT_FILE"
+printf '\033[?2026l'
+"#,
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", fake_ssh)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env("TEST_INPUT_FILE", &input_file)
+        .env("TEST_INPUT_LEN", INPUT.len().to_string())
+        .env("CRUSH_TRACE", &trace_file)
+        .arg("user@example.test");
+
+    let mut run = PtyRun::spawn(command, Some(READY));
+    run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
+
+    let mut typed = Vec::new();
+    for &byte in INPUT {
+        let typed_at = Instant::now();
+        run.write_input(&[byte]);
+        let local_append = [b"\x1b[2m".as_slice(), &[byte], b"\x1b[22m"].concat();
+        wait_for_output(&run, &local_append);
+        assert!(
+            typed_at.elapsed() < Duration::from_millis(100),
+            "local key feedback exceeded 100 ms for {byte:?}"
+        );
+        typed.push(byte);
+        let cursor_underlay = PLACEHOLDER[typed.len()];
+        let software_cursor_position = format!("\x1b[10;{}H", 3 + typed.len()).into_bytes();
+        let software_cursor = if cursor_underlay == b' ' {
+            [
+                software_cursor_position.as_slice(),
+                b"\x1b[7m",
+                &[cursor_underlay],
+                b"\x1b[27m",
+                software_cursor_position.as_slice(),
+            ]
+            .concat()
+        } else {
+            [
+                software_cursor_position.as_slice(),
+                b"\x1b[2;7m".as_slice(),
+                &[cursor_underlay],
+                b"\x1b[22;27m",
+                software_cursor_position.as_slice(),
+            ]
+            .concat()
+        };
+        let recomposed = [
+            b"\x1b[10;3H\x1b[?25l\x1b[10;3H\x1b[2m".as_slice(),
+            typed.as_slice(),
+            b"\x1b[22m",
+            software_cursor.as_slice(),
+            b"\x1b[?2026l",
+        ]
+        .concat();
+        wait_for_output(&run, &recomposed);
+    }
+
+    let (status, output) = run.finish();
+    assert!(status.success(), "status={status}, output={output:?}");
+    assert_eq!(
+        fs::read(input_file).expect("read coding-agent input"),
+        INPUT
+    );
+    let first_local = find_subslice(&output, b"\x1b[2mc\x1b[22m")
+        .expect("output contains the first local character");
+    assert!(
+        max_consecutive_byte(&output[first_local..], b'\x08') == 0,
+        "per-key agent redraws must never perform a relative cursor rewind: {output:?}"
+    );
+    let trace = fs::read_to_string(trace_file).expect("read per-key agent trace");
+    assert_agent_render_latency(&trace, INPUT.len());
+    assert!(
+        !trace.contains("\"event\":\"prediction_blocked\""),
+        "agent redraws must not disable following keys: {trace}"
+    );
+}
+
+#[test]
+fn fast_prediction_keeps_every_key_local_during_a_continuous_agent_stream() {
+    const READY: &[u8] = b"\x1b[?2026l";
+    const INPUT: &[u8] = b"streaminglatencystreaminglatencystreaminglatencystreaminglatency";
+
+    let temp = TempDir::new("coding-agent-continuous-stream");
+    let input_file = temp.file("input.bin");
+    let stop_file = temp.file("stop");
+    let trace_file = temp.file("trace.jsonl");
+    let fake_ssh = temp.executable(
+        "continuous-coding-agent-ssh",
+        r#"#!/bin/sh
+stty raw -echo
+printf '\033[?2026h\033[2J\033[H\033[10;1H\033[1m\342\200\272\033[22m\033[10;3H\033[2mExplain this codebase\033[22m\033[?25h\033[10;3H\033[?2026l'
+(
+    i=1
+    while [ ! -e "$TEST_STOP_FILE" ]; do
+        printf '\033[?2026h\033[5;1H\033[2mStreaming %s\033[22m\033[10;3H\033[?2026l' "$i"
+        i=$((i + 1))
+        sleep 0.002
+    done
+) &
+producer=$!
+dd of="$TEST_INPUT_FILE" bs=1 count="$TEST_INPUT_LEN" 2>/dev/null
+: > "$TEST_STOP_FILE"
+wait "$producer"
+sleep 0.1
+printf '\033[?2026h\033[10;3H'
+cat "$TEST_INPUT_FILE"
+printf '\033[?2026l'
+"#,
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", fake_ssh)
+        .env("CRUSH_MODE", "force")
+        .env("CRUSH_PREDICT", "fast")
+        .env("TEST_INPUT_FILE", &input_file)
+        .env("TEST_INPUT_LEN", INPUT.len().to_string())
+        .env("TEST_STOP_FILE", &stop_file)
+        .env("CRUSH_TRACE", &trace_file)
+        .arg("user@example.test");
+
+    let mut run = PtyRun::spawn(command, Some(READY));
+    run.wait_until_ready();
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
+    for &byte in INPUT {
+        run.write_input(&[byte]);
+        thread::sleep(Duration::from_millis(3));
+    }
+
+    let (status, output) = run.finish();
+    assert!(status.success(), "status={status}, output={output:?}");
+    assert_eq!(fs::read(input_file).expect("read streamed input"), INPUT);
+    let trace = fs::read_to_string(trace_file).expect("read continuous-stream trace");
+    assert_agent_render_latency(&trace, INPUT.len());
+    assert_input_forward_latency(&trace, INPUT.len());
+    assert!(
+        !trace.contains("\"event\":\"prediction_blocked\"")
+            && !trace.contains("\"event\":\"prediction_stale\"")
+            && !trace.contains("\"event\":\"shadow_lag\""),
+        "continuous agent output must not take local feedback away from a key: {trace}"
+    );
+}
+
+fn assert_input_forward_latency(trace: &str, expected_keys: usize) {
+    let mut latencies = trace_values_from_contents(trace, "input_forwarded", "latency_us");
+    assert_eq!(
+        latencies.len(),
+        expected_keys,
+        "every independently read key must reach the SSH PTY: {trace}"
+    );
+    let maximum = latencies.iter().copied().max().unwrap_or_default();
+    assert!(
+        maximum < 50_000,
+        "worst input-read to SSH-PTY-write latency was {maximum} us: {trace}"
+    );
+    let median = percentile(&mut latencies, 50);
+    let p99 = percentile(&mut latencies, 99);
+    eprintln!(
+        "per-key SSH PTY forwarding: p50 {median} us, p99 {p99} us, max {maximum} us across {expected_keys} streamed keys"
+    );
+}
+
+fn assert_agent_render_latency(trace: &str, expected_keys: usize) {
+    let mut latencies = trace_values_from_contents(trace, "prediction_rendered", "latency_us");
+    assert_eq!(
+        latencies.len(),
+        expected_keys,
+        "every key must be rendered in its input observation turn: {trace}"
+    );
+    let maximum = latencies.iter().copied().max().unwrap_or_default();
+    assert!(
+        maximum < 50_000,
+        "worst per-key input-read to local-render latency was {maximum} us: {trace}"
+    );
+    let median = percentile(&mut latencies, 50);
+    let p99 = percentile(&mut latencies, 99);
+    eprintln!(
+        "per-key coding-agent local echo: p50 {median} us, p99 {p99} us, max {maximum} us across {expected_keys} redraws"
+    );
+}
+
+fn percentile(values: &mut [u64], percentile: usize) -> u64 {
+    values.sort_unstable();
+    let index = values
+        .len()
+        .saturating_sub(1)
+        .saturating_mul(percentile.min(100))
+        / 100;
+    values.get(index).copied().unwrap_or_default()
 }
 
 #[test]
@@ -488,8 +1071,6 @@ cat "$TEST_PREDICTED_FILE"
     wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
     run.write_input(b"p");
     wait_for_file(&probe_echoed);
-    // The remote marker can precede the local relay's physical write, while
-    // probe confirmation happens only after the sidecar parses that write.
     wait_for_output(&run, b"p");
     wait_for_file_contents(&trace_file, b"\"event\":\"prediction_trusted\"");
     run.write_input(b"x");
@@ -786,19 +1367,13 @@ fn child_signal_is_preserved_as_wait_signal_status() {
 
 fn tmux_transcript() -> Vec<u8> {
     [
-        // Reset, clear, home, and status-line positioning.
         b"\x1bc\x1b[2J\x1b[H\x1b[24;1H\x1b[7m[tmux status]\x1b[0m\x1b[1;1H".as_slice(),
-        // Alternate screen, cursor modes, focus, mouse, and bracketed paste.
         b"\x1b[?1049h\x1b[?25l\x1b[5 q\x1b[?1004h\x1b[?1006h\x1b[?2004h",
-        // Tmux and arbitrary DCS passthrough, including an escaped ESC.
         b"\x1bPtmux;\x1b\x1b]52;c;Y3J1c2g=\x07\x1b\\\x1bPq#0;2;0;0;0#1!3~\x1b\\",
-        // OSC title/hyperlink plus APC, PM, and SOS strings.
         b"\x1b]2;remote tmux\x07\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x1b\\",
         b"\x1b_Ga=d;OK\x1b\\\x1b^private-message\x1b\\\x1bXsos-data\x1b\\",
-        // A synchronized update followed by common capability queries.
         b"\x1b[?2026h\x1b[10;20Hagent output\x1b[24;1Hstatus\x1b[?2026l",
         b"\x1b[c\x1b[>c\x1b[6n\x1b[?2004$p\x1b]10;?\x07\x1b]11;?\x07",
-        // Restore ordinary modes and leave a deterministic final marker.
         b"\x1b[?2004l\x1b[?1006l\x1b[?1004l\x1b[?25h\x1b[?1049lEND",
     ]
     .concat()
@@ -806,14 +1381,10 @@ fn tmux_transcript() -> Vec<u8> {
 
 fn terminal_input_fixture() -> Vec<u8> {
     let mut fixture = [
-        // Ctrl-G is a valid custom tmux prefix and must not be stolen.
         b"\x07c\x07[".as_slice(),
-        // Bracketed paste payload, including line endings and an escape.
         b"\x1b[200~first line\nsecond \x1b line\x1b[201~",
-        // Focus, SGR mouse, CSI-u, Kitty-key release, and terminal replies.
         b"\x1b[I\x1b[O\x1b[<0;12;4M\x1b[<0;12;4m\x1b[97;5u\x1b[97;1:3u",
         b"\x1b[?1;2c\x1b[12;40R\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
-        // Raw control and binary bytes must survive the relay as well.
         b"\x00\x03\x04\x1c\x7f",
     ]
     .concat();
@@ -1152,6 +1723,29 @@ fn wait_for_file_contents(path: &Path, marker: &[u8]) {
     }
 }
 
+fn trace_value(path: &Path, event: &str, key: &str) -> Option<u64> {
+    let contents = fs::read_to_string(path).ok()?;
+    trace_values_from_contents(&contents, event, key)
+        .into_iter()
+        .next()
+}
+
+fn trace_values_from_contents(contents: &str, event: &str, key: &str) -> Vec<u64> {
+    let event_marker = format!("\"event\":\"{event}\"");
+    let value_marker = format!("\"{key}\":");
+    contents
+        .lines()
+        .filter_map(|line| {
+            if !line.contains(&event_marker) {
+                return None;
+            }
+            let value = line.split_once(&value_marker)?.1;
+            let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+            value[..digits].parse().ok()
+        })
+        .collect()
+}
+
 fn wait_for_output(run: &PtyRun, marker: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1171,6 +1765,20 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn max_consecutive_byte(bytes: &[u8], needle: u8) -> usize {
+    let mut current = 0;
+    let mut maximum = 0;
+    for &byte in bytes {
+        if byte == needle {
+            current += 1;
+            maximum = maximum.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    maximum
 }
 
 fn decode_nul_arguments(bytes: &[u8]) -> Vec<Vec<u8>> {

@@ -9,15 +9,21 @@ use std::process::Command;
 pub(crate) const CRUSH_SSH: &str = "CRUSH_SSH";
 pub(crate) const CRUSH_MODE: &str = "CRUSH_MODE";
 pub(crate) const CRUSH_PREDICT: &str = "CRUSH_PREDICT";
+pub(crate) const CRUSH_TRANSPORT: &str = "CRUSH_TRANSPORT";
+pub(crate) const CRUSH_SERVER: &str = "CRUSH_SERVER";
+pub(crate) const CRUSH_PORT: &str = "CRUSH_PORT";
 pub(crate) const CRUSH_TRACE: &str = "CRUSH_TRACE";
 pub(crate) const CRUSH_ACTION: &str = "CRUSH_ACTION";
 
 /// Known Crush variables. `strip_crush_env` also strips future `CRUSH_*`
 /// variables inherited from the current process.
-pub(crate) const CRUSH_ENV_VARS: [&str; 5] = [
+pub(crate) const CRUSH_ENV_VARS: [&str; 8] = [
     CRUSH_SSH,
     CRUSH_MODE,
     CRUSH_PREDICT,
+    CRUSH_TRANSPORT,
+    CRUSH_SERVER,
+    CRUSH_PORT,
     CRUSH_TRACE,
     CRUSH_ACTION,
 ];
@@ -34,7 +40,51 @@ pub(crate) enum Mode {
 pub(crate) enum Prediction {
     #[default]
     Auto,
+    Fast,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Transport {
+    #[default]
+    Auto,
+    Mobile,
+    Ssh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PortRange {
+    pub(crate) first: u16,
+    pub(crate) last: u16,
+}
+
+impl Default for PortRange {
+    fn default() -> Self {
+        Self {
+            first: 60_000,
+            last: 61_000,
+        }
+    }
+}
+
+impl PortRange {
+    pub(crate) fn parse(value: &OsStr) -> Option<Self> {
+        let text = value.to_str()?;
+        let (first, last) = text
+            .split_once(':')
+            .map_or((text, text), |(first, last)| (first, last));
+        let first = first.parse::<u16>().ok().filter(|port| *port != 0)?;
+        let last = last.parse::<u16>().ok().filter(|port| *port != 0)?;
+        (first <= last).then_some(Self { first, last })
+    }
+
+    pub(crate) fn argument(self) -> String {
+        if self.first == self.last {
+            self.first.to_string()
+        } else {
+            format!("{}:{}", self.first, self.last)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +99,9 @@ pub(crate) struct Config {
     pub(crate) ssh_program: OsString,
     pub(crate) mode: Mode,
     pub(crate) prediction: Prediction,
+    pub(crate) transport: Transport,
+    pub(crate) server_program: OsString,
+    pub(crate) port_range: PortRange,
     /// Kept as a `PathBuf` so a non-UTF-8 trace path is not changed.
     pub(crate) trace: Option<PathBuf>,
     pub(crate) action: Option<Action>,
@@ -82,14 +135,45 @@ impl Config {
         let prediction = match get(CRUSH_PREDICT) {
             None => Prediction::Auto,
             Some(value) if value == OsStr::new("auto") => Prediction::Auto,
+            Some(value) if value == OsStr::new("fast") => Prediction::Fast,
             Some(value) if value == OsStr::new("off") => Prediction::Off,
             Some(value) => {
                 return Err(ConfigError::invalid(
                     CRUSH_PREDICT,
                     value,
-                    "one of: auto, off",
+                    "one of: auto, fast, off",
                 ));
             }
+        };
+
+        let transport = match get(CRUSH_TRANSPORT) {
+            None => Transport::Auto,
+            Some(value) if value == OsStr::new("auto") => Transport::Auto,
+            Some(value) if value == OsStr::new("mobile") => Transport::Mobile,
+            Some(value) if value == OsStr::new("ssh") => Transport::Ssh,
+            Some(value) => {
+                return Err(ConfigError::invalid(
+                    CRUSH_TRANSPORT,
+                    value,
+                    "one of: auto, mobile, ssh",
+                ));
+            }
+        };
+
+        let server_program = match get(CRUSH_SERVER) {
+            Some(value) => nonempty(CRUSH_SERVER, value, "a non-empty remote command")?,
+            None => OsString::from("crush"),
+        };
+
+        let port_range = match get(CRUSH_PORT) {
+            None => PortRange::default(),
+            Some(value) => PortRange::parse(&value).ok_or_else(|| {
+                ConfigError::invalid(
+                    CRUSH_PORT,
+                    value,
+                    "a nonzero port or ascending range such as 60000:61000",
+                )
+            })?,
         };
 
         let trace = get(CRUSH_TRACE)
@@ -113,6 +197,9 @@ impl Config {
             ssh_program,
             mode,
             prediction,
+            transport,
+            server_program,
+            port_range,
             trace,
             action,
         })
@@ -210,6 +297,9 @@ mod tests {
                 ssh_program: OsString::from("ssh"),
                 mode: Mode::Auto,
                 prediction: Prediction::Auto,
+                transport: Transport::Auto,
+                server_program: OsString::from("crush"),
+                port_range: PortRange::default(),
                 trace: None,
                 action: None,
             }
@@ -222,6 +312,9 @@ mod tests {
             (CRUSH_SSH, OsString::from("/opt/openssh/bin/ssh")),
             (CRUSH_MODE, OsString::from("force")),
             (CRUSH_PREDICT, OsString::from("off")),
+            (CRUSH_TRANSPORT, OsString::from("mobile")),
+            (CRUSH_SERVER, OsString::from("/opt/crush/bin/crush")),
+            (CRUSH_PORT, OsString::from("61000:61010")),
             (CRUSH_TRACE, OsString::from("/tmp/crush.trace")),
             (CRUSH_ACTION, OsString::from("doctor")),
         ])
@@ -230,6 +323,15 @@ mod tests {
         assert_eq!(parsed.ssh_program, OsStr::new("/opt/openssh/bin/ssh"));
         assert_eq!(parsed.mode, Mode::Force);
         assert_eq!(parsed.prediction, Prediction::Off);
+        assert_eq!(parsed.transport, Transport::Mobile);
+        assert_eq!(parsed.server_program, OsStr::new("/opt/crush/bin/crush"));
+        assert_eq!(
+            parsed.port_range,
+            PortRange {
+                first: 61_000,
+                last: 61_010
+            }
+        );
         assert_eq!(parsed.trace, Some(PathBuf::from("/tmp/crush.trace")));
         assert_eq!(parsed.action, Some(Action::Doctor));
 
@@ -244,6 +346,12 @@ mod tests {
                 .unwrap()
                 .action,
             Some(Action::Version)
+        );
+        assert_eq!(
+            config(&[(CRUSH_PREDICT, OsString::from("fast"))])
+                .unwrap()
+                .prediction,
+            Prediction::Fast
         );
     }
 
@@ -261,6 +369,9 @@ mod tests {
             (CRUSH_MODE, "fast"),
             (CRUSH_PREDICT, "on"),
             (CRUSH_TRACE, ""),
+            (CRUSH_TRANSPORT, "udp"),
+            (CRUSH_SERVER, ""),
+            (CRUSH_PORT, "61000:60000"),
             (CRUSH_ACTION, "help"),
         ] {
             let error = config(&[(name, OsString::from(value))]).unwrap_err();

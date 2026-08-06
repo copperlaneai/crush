@@ -1,185 +1,208 @@
 # Architecture
 
-Crush is a local process wrapper around the user's OpenSSH executable. It is not
-an SSH implementation and, in version 1, has no remote component.
-
-## Invariants
-
-The following invariants take precedence over prediction coverage:
-
-1. Bytes read from the physical terminal are written to OpenSSH unchanged and
-   in order.
-2. During a running relay, bytes read from OpenSSH's PTY are queued for the
-   physical terminal unchanged, exactly once, and without a batching timer.
-3. Raw input does not wait for parsing, prediction, rendering, tracing, or remote
-   output.
-4. Lifecycle signals are handled before a simultaneously readable PTY. Absent
-   such a transition, each readiness turn queues and attempts the physical
-   write of raw output before bounded observer work.
-5. A speculative overlay is removed before authoritative output is displayed.
-6. Uncertainty disables prediction; it never changes the relay.
-7. Crush reserves no terminal key and answers no terminal query.
-
-These rules are the compatibility boundary. An optimization that violates one
-of them is not suitable for Crush.
+Crush has two interactive transports and a direct-OpenSSH compatibility path.
+The default `auto` policy prefers the mobile transport for login shells and
+falls back to the SSH relay when its prerequisites are unavailable.
 
 ## Session selection
 
-The invocation classifier examines SSH option shapes without interpreting SSH
-configuration or contacting a server.
-
-- Clearly interactive invocations enter the PTY relay.
-- Non-TTY, forwarding-only, multiplex-control, configuration-printing,
-  background, and uncertain invocations directly execute OpenSSH.
-- Arguments remain operating-system strings; Crush does not normalize them to
-  UTF-8.
-- Crush does not call `ssh -G`, inject `-t`, or add network tuning.
-
-`CRUSH_MODE=force` requires the PTY relay for an otherwise compatible local TTY,
-but it cannot force unsafe prediction. `CRUSH_MODE=passthrough` always executes
-OpenSSH directly.
-
-## Interactive process topology
-
 ```text
-physical terminal
-  input ──> input relay ──> OpenSSH PTY
-                  └──────> bounded prediction observer
-
-OpenSSH PTY
-  output ──> render arbiter ──> physical terminal
-                  └──────> bounded shadow observer
+                         ┌─ noninteractive/uncertain ─> exec OpenSSH
+crush argv ─> classifier ┤
+                         └─ interactive login shell
+                              ├─ mobile helper available ─> state sync
+                              └─ otherwise ───────────────> SSH PTY relay
 ```
 
-OpenSSH owns authentication, configuration, host keys, encryption, proxying,
-forwarding, network I/O, and its remote PTY request. Crush owns the local PTY,
-raw-terminal guard, relay scheduling, resize propagation, terminal shadow, and
-temporary local overlay.
+Forwarding, subsystems, remote commands without the mobile contract,
+multiplex-control operations, configuration queries, and non-TTY callers retain
+OpenSSH semantics. `CRUSH_TRANSPORT=mobile` makes helper failure explicit;
+`CRUSH_TRANSPORT=ssh` bypasses mobile bootstrap.
 
-The input relay is independent of output processing so a streamed build or
-coding-agent response cannot starve a keystroke. Side observers use bounded,
-best-effort queues. If they fall behind, Crush drops observation state and
-continues the raw relay. Remote output enters a bounded, nonblocking physical
-output FIFO and is drained immediately; PTY reads pause at the high-water mark,
-so authoritative bytes are backpressured rather than dropped. Adjacent chunks
-coalesce to keep allocation count bounded. Shadow parsing runs in bounded slices
-only when the PTY is momentarily quiescent and physical output has drained. A
-continuous stream that fills the shadow backlog resets the sidecar instead of
-putting parsing ahead of the next remote write. With `CRUSH_PREDICT=off`, the
-shadow and input-payload observation copies are not created; an enabled trace
-receives only input count/timing metadata.
+## Mobile process topology
 
-Only the render arbiter writes to physical stdout. This provides a narrow point
-at which an old overlay can be removed immediately before new remote bytes are
-written, without allowing the parser to hold up those bytes.
+```text
+local                                                   remote
 
-## Terminal shadow and prediction
+physical terminal                                       login shell / tmux / TUI
+  │ input                                                      │
+  ├─> overwrite predictor                                      │ PTY output
+  └─> sequenced encrypted UDP ────────────────> crush --server ─┤
+                                                               │
+changed-cell renderer <─ compressed framebuffer snapshots <────┘
 
-The shadow terminal contains only committed remote output. Locally predicted
-cells never enter it. Prediction has two independent trust dimensions:
+OpenSSH ── authentication + one-time key/bootstrap ──> crush --server
+```
 
-- **Terminal trust:** parser ground state, active buffer, cursor, dimensions,
-  rendition, wrapping, modes, and known underlying cells are coherent.
-- **Echo confidence:** the current remote application has recently demonstrated
-  an exact, linear echo at the expected cursor.
+OpenSSH still owns user configuration, host aliases, host-key verification,
+authentication, agent use, and helper launch. The helper is an unprivileged
+process running as the authenticated user. SSH transports the ephemeral session
+key; interactive terminal traffic does not remain behind SSH's ordered byte
+stream after bootstrap.
 
-At the start of an epoch, Crush forwards one eligible printable byte without
-drawing it. An exact authoritative echo promotes the epoch. Later eligible bytes
-may be drawn as a plain disposable overlay while still being sent to OpenSSH
-immediately. Overlay frames use only printable ASCII, backspace, and space, so
-abandoning an unwritten suffix cannot strand the terminal inside a control
-sequence.
+### Bootstrap
 
-The initial shadow assumes only the conventional VT application-entry modes that
-tmux and other terminal programs themselves expect from a normal shell: insert,
-newline, origin, horizontal-margin, protection, and synchronized-update modes
-off; autowrap and cursor visibility on; full-height margins; and ASCII G0/G1.
-Crush emits no startup normalization and never uses these assumptions after
-skipped output or suspend/resume. A recreated shadow also treats the terminal's
-parser grammar as unknown: bare RIS is not proof because VT52 and Tektronix
-modes can interpret or ignore it as data. An observed Tektronix exit (`ESC ETX`)
-followed by the VT52 ANSI-exit (`ESC <`) proves ANSI parsing from the unknown
-state; only a following RIS resets that epoch. If Crush observed entry into one
-specific foreign-grammar switch, both exits are still required: emulator builds
-may ignore either optional switch, so the physical grammar is ambiguous. At
-ordinary application entry, every physical cell, cursor position, and the
-inherited rendition remain unknown until authoritative output supplies a
-rendition reset followed by a full-screen erase and absolute cursor anchor (or
-an equivalent known alternate-screen transition). A reset observed after an
-erase cannot retroactively prove the erased cells' attributes. Every overlay
-target must be a proven blank default cell. Unknown or mismatched display state
-disables prediction. An ordinary login prompt—and some tmux startup frames—may
-therefore remain raw-relay-only until a remote application performs a complete
-safe redraw.
+1. The client starts OpenSSH with the original login-shell arguments and the
+   configured helper command followed by `--server`.
+2. The helper binds the first available IPv4 UDP port in the configured range
+   (`60000:61000` by default) and generates a random 256-bit key.
+3. It returns `CRUSH/1 <port> <hex-key>` through the authenticated SSH channel.
+4. The client resolves the effective `Hostname` with `ssh -G`, sends terminal
+   dimensions and Crush's stable `xterm-256color` emulator baseline in an
+   authenticated UDP hello, and enters raw mode.
+5. The helper forks into a new session without placing the key in arguments or
+   environment, redirects the inherited standard descriptors to `/dev/null`,
+   and lets the SSH bootstrap close.
+6. The detached helper allocates a PTY and launches the remote login shell while
+   all terminal traffic uses UDP. A later TCP/SSH failure cannot end a healthy
+   mobile session.
 
-Version 1 predicts only single-cell printable ASCII appended within a line and
-backspace confined to the unresolved suffix. Enter, Escape, control keys,
-navigation, paste, mouse, focus, Unicode, resize, screen changes, contradiction,
-or unexpected cursor motion end the epoch.
+`ProxyJump` and `ProxyCommand` currently make direct UDP ineligible. Auto mode
+terminates the attempted helper and starts the ordinary SSH relay.
 
-Before remote output, the arbiter restores the overlay's confirmed underlying
-cells and terminal state, writes the remote bytes unchanged, advances the
-shadow, reconciles acknowledgements, and redraws only a still-valid suffix. It
-does not use terminal save/restore slots, change modes, scroll, wrap, or retain
-and re-render the full screen.
+## Datagram protocol
 
-## Tmux
+Every packet has a small authenticated header containing protocol marker,
+packet kind, sequence number, and fragment coordinates. Payloads use
+ChaCha20-Poly1305 with the SSH-bootstrapped session key. Packet kinds occupy
+independent nonce/sequence spaces. A retransmission reuses a nonce only with the
+same authenticated bytes.
 
-Tmux remains a normal remote terminal application. Crush does not invoke tmux
-control mode, inspect tmux configuration, rewrite the remote command, or install
-a plugin.
+Datagrams are capped at 1200 bytes to avoid ordinary path-MTU fragmentation.
+Screen states larger than one datagram are split into bounded authenticated
+fragments. The client keeps only a small window of recent incomplete states;
+completing a newer state discards older assemblies.
 
-Input protocols—including custom prefixes, bracketed paste, mouse, focus,
-extended keys, and terminal query replies—remain opaque byte streams to the
-relay. Output protocols—including OSC, DCS passthrough, alternate screens,
-cursor style, and synchronized updates—also remain opaque to the relay while the
-side parser tracks enough state to decide whether an overlay is safe.
+Input packets have monotonically increasing sequence numbers. The helper
+deduplicates, buffers a bounded out-of-order window, and writes them to the PTY
+in order. The latest accepted input sequence is carried in screen states.
+Unacknowledged input is retransmitted without blocking newer screen packets.
 
-Prefix/control sequences and tmux-owned modes reset prediction. Once an
-authoritative redraw establishes a safe pane anchor, ordinary typing performs a
-fresh probe and re-arms. Status-line redraws may preserve an epoch only when the
-authoritative cursor and cells return to that same safe anchor.
+A valid packet received from a new source address migrates the server's client
+endpoint. This permits IP/interface roaming while both Crush processes remain
+alive. Authentication prevents an off-path host from redirecting the session.
 
-See [ADR 0004](adr/0004-native-tmux-protocol.md) and
-[Compatibility](compatibility.md#tmux).
+## Authoritative screen synchronization
 
-## Terminal and process lifecycle
+The helper feeds PTY output into a full terminal emulator. It also returns
+terminal-generated replies (such as device-status and size responses) to the
+remote PTY, rather than forwarding queries across a latency-sensitive byte
+stream.
 
-An interactive session performs these steps:
+At 4 ms output quiet or a 16 ms frame deadline, the helper captures:
 
-1. Capture termios and complete window size, including pixel dimensions.
-2. Create a PTY and spawn OpenSSH with the slave as its controlling terminal.
-3. Start relay workers, then place the physical terminal in raw mode under a
-   restoration guard.
-4. Forward resize events to the PTY. Since the physical emulator may already
-   have reflowed, abandon old overlay coordinates without a destructive erase
-   and wait for the application's authoritative redraw.
-5. Before stop or termination, pause new input and try to finish the exact
-   queued prefix plus the overlay erase. This cleanup waits at most 100 ms. If
-   stdout remains unwritable, retain authoritative queue order, discard only
-   stale synthetic suffixes, and continue terminal handoff; a partial plain-text
-   overlay can remain visible until the shell or application redraws.
-6. Mirror EOF, PTY hangup, child exit, stop/resume, and terminal signals.
-7. Restore the physical terminal on every controlled exit and panic path, then
-   preserve OpenSSH's status or terminating signal where the platform permits.
+- visible rows and columns;
+- Unicode base character, foreground/background color, and rendition flags for
+  each cell;
+- cursor position and visibility;
+- terminal input modes, title, and bell state;
+- latest accepted input sequence;
+- a deliberately delayed echo-validation sequence; and
+- whether the current screen context permits speculative echo.
 
-Threads are started only after process creation so the child side of `fork` or
-`pre_exec` remains minimal and auditable.
+States are LZ4-compressed independently. Under acknowledgement backlog the frame
+interval expands to 33 ms, and unacknowledged latest state is retried. Because a
+state does not depend on every preceding frame, the client can skip obsolete
+coding-agent paints and display the newest complete screen.
 
-## Diagnostics
+The client first composes remote truth and every still-valid conditional cell
+into one candidate framebuffer. It compares that candidate with the previously
+displayed candidate and emits only changed cell runs, plus terminal mode
+changes, inside one synchronized update. The first state and
+size/alternate-screen transitions receive a full repaint.
 
-Crush has no telemetry. An explicit `CRUSH_TRACE` file records bounded
-metadata—timestamps, byte counts, queue pressure, state transitions, rollback
-reasons, and session outcome. It must never record arguments, hostnames,
-keystrokes, terminal bytes, query replies, or clipboard data. Files are created
-with owner-only permissions and are never uploaded automatically. Formatting and
-file writes run on a bounded, drop-on-full worker so diagnostics cannot hold up
-the relay. Traces are best-effort diagnostics: queue pressure, an I/O failure, or
-process teardown may omit events at the tail of a file.
+## Overwrite-only local prediction
 
-## Deferred remote helper
+Mosh's default predictor models shell insertion by shifting the remainder of a
+row right. That makes right prompts, tmux decorations, and coding-agent text move
+temporarily. Mosh's `--predict-overwrite` avoids it.
 
-A later opt-in helper may add authoritative input acknowledgements, remote screen
-checkpoints, reconnection, roaming, and state synchronization. It must be launched
-through authenticated OpenSSH, negotiate capabilities, and fall back to this
-client-only architecture. It is not required for tmux correctness.
+Crush has no insert-style prediction. Every eligible character:
+
+1. is assigned an absolute `(row, column)` from the last authoritative cursor;
+2. overwrites only that physical cell in faint style;
+3. advances the displayed cursor to the next absolute cell; and
+4. remains a conditional replacement outside the authoritative framebuffer.
+
+The renderer never emits ICH (`CSI @`) or relative-backspace cleanup. It applies
+predictions before diffing, so an unrelated authoritative update never touches
+the predicted row. Matching authoritative cells require at most a rendition
+change from faint to normal, with the cursor staying at the composed location.
+
+When the cursor is inside side-by-side tmux panes, Crush identifies continuous
+vertical border segments in the authoritative framebuffer. Their columns and
+vertical extent define the editable pane rectangle: wrapping returns to that
+pane's left edge, never the terminal's left edge, and prediction stops before a
+divider or status row. A changed border layout starts a new prediction epoch.
+
+Remote output does not invalidate pending printable text merely because an
+unrelated status frame moved the authoritative cursor. Transport receipt is
+acknowledged immediately for retransmission, while a separate 50 ms delayed echo
+acknowledgement makes a conditional cell eligible for validation. It is not
+evidence that the application has repainted the input widget. If the
+authoritative cursor is still behind the predicted cursor, Crush retains the
+conditional suffix. It relinquishes the local cursor only after authoritative
+state reaches the same cell; a contradictory eligible cell must then remain
+stable for 250 ms before rollback. This is essential for coding agents that
+repaint status content before processing every key. Enter and simple left/right
+movement receive conditional cursor predictions; paste and ambiguous controls
+are barriers. Enter additionally hands control to the first echo-eligible remote
+state, since launching a full-screen application need not pass through the
+shell's predicted next-row cursor.
+
+The helper's terminal parser buffers explicit synchronized updates until their
+end marker. For a long tmux repaint without such markers, deadline frames may
+advance content but publish a new cursor only after it repeats or the output
+stream becomes quiet. This prevents internal repaint coordinates from appearing
+as user-visible cursor teleports while preserving bounded streaming progress.
+
+Kitty keyboard and xterm modifyOtherKeys printable sequences are decoded for
+visual prediction while their original bytes remain the only input sent to the
+server. Release events are ignored, and bracketed-paste payloads are never
+predicted.
+
+### Echo safety under tmux
+
+Zsh line editing, tmux, and full-screen programs intentionally disable kernel
+echo and implement their input widgets in terminal output, so the PTY `ECHO` bit
+cannot classify secrets. Primary- and alternate-screen contexts may predict
+unless the current row contains a common password, passphrase, secret, token, or
+login prompt shape.
+
+This is safer than a client-only fast predictor and preserves tmux performance,
+but it is not proof against an intentionally disguised secret prompt. Set
+`CRUSH_PREDICT=off` for unusual secret-entry applications.
+
+## Terminal mode synchronization
+
+The authoritative state drives local application-cursor, application-keypad,
+mouse reporting, focus reporting, bracketed paste, SGR mouse, alternate screen,
+cursor visibility, and Kitty keyboard flags. The client resets these modes and
+restores termios on controlled exit.
+
+Cell snapshots currently omit combining-mark and OSC 8 hyperlink metadata.
+Their base characters are retained. Adding these fields is a protocol-versioned
+extension, not a reason to infer screen state on the client.
+
+## SSH fallback
+
+The legacy transport remains a byte-transparent OpenSSH PTY relay with an
+optional client-side terminal shadow and disposable local overlay. It preserves
+ProxyJump, ProxyCommand, existing network paths, remote commands with explicit
+TTY allocation, and hosts without the helper. It cannot skip streamed bytes or
+know nested tmux/TUI state as reliably as the mobile transport.
+
+## Resource bounds
+
+- UDP datagrams: 1200 bytes.
+- Frame fragments: bounded protocol window.
+- Visible cells: 100,000 per frame.
+- Incomplete client frames: three recent generations.
+- Reordered input: 64 packets.
+- Pending client input: 256 packets.
+- Remote output read: 64 KiB per turn.
+- Helper idle timeout: ten minutes without an authenticated client packet.
+
+Malformed, unauthenticated, replayed, oversized, or out-of-window packets are
+discarded or terminate only the affected mobile session. They never become
+terminal input.

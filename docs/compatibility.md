@@ -1,118 +1,131 @@
 # Compatibility contract
 
-Crush aims to be a drop-in command replacement for interactive OpenSSH on
-supported POSIX clients. Compatibility means the SSH process receives the same
-arguments, environment (apart from removed `CRUSH_*` settings), terminal input,
-window changes, and lifecycle events it would receive through a direct local
-terminal.
+Crush aims to replace the `ssh` command at the invocation boundary while using
+the fastest transport compatible with the requested operation.
 
-## Supported clients
+## Transport matrix
 
-| Platform | Architectures | Version 1 status |
+| Operation | Auto behavior |
+| --- | --- |
+| Interactive login shell, helper installed, direct IPv4 UDP | Mobile state sync |
+| Interactive login shell without helper/UDP | OpenSSH PTY relay |
+| `ProxyJump` or `ProxyCommand` | OpenSSH PTY relay |
+| Remote command with explicit `-t` | OpenSSH PTY relay |
+| Noninteractive command | Direct OpenSSH execution |
+| Forwarding, subsystem, multiplex control, `-G`, `-V`, `-T` | Direct OpenSSH execution |
+| Unknown/malformed option shape | Direct OpenSSH execution |
+
+`CRUSH_TRANSPORT=mobile` turns a missing mobile prerequisite into an error.
+`CRUSH_TRANSPORT=ssh` disables helper bootstrap. `CRUSH_MODE=passthrough`
+directly executes OpenSSH regardless of transport settings.
+
+OpenSSH remains responsible for configuration, `Include`/`Match`,
+canonicalization, authentication, host keys, agents, certificates, security
+keys, connection sharing, forwarding, jump hosts, remote commands, subsystems,
+and escape semantics on SSH paths.
+
+## Platforms
+
+| Platform | Architectures | Status |
 | --- | --- | --- |
-| Linux | x86-64, ARM64 | Supported with static musl release archives |
-| macOS 11 or newer | x86-64, Apple Silicon | Supported |
-| Windows/ConPTY | — | Deferred until after 1.0 |
+| Linux | x86-64, ARM64 | Supported target |
+| macOS 11+ | x86-64, Apple Silicon | Supported target |
+| Windows/ConPTY | — | Deferred |
 
-The minimum supported Rust version applies to source builds, not release users.
-The installer selects the static musl archive on every Linux distribution,
-including glibc-based systems. GNU target archives remain available for explicit
-manual download and source-oriented compatibility work, but their minimum glibc
-runtime version is not part of this compatibility contract.
+The source-build MSRV is Rust 1.85. Client and helper should use the same Crush
+version until protocol negotiation supports mixed versions.
 
-## OpenSSH behavior
+## Mobile prerequisites
 
-OpenSSH is discovered through `PATH`, unless `CRUSH_SSH` selects an explicit
-executable. Recursive resolution back to Crush is rejected.
+- `crush` is available in remote `PATH`, or `CRUSH_SERVER` names its path.
+- The SSH destination resolves to a directly reachable IPv4 address.
+- A return UDP flow to the helper's configured port/range is permitted
+  (`60000:61000` by default).
+- The invocation requests an interactive login shell.
+- Client input/output/error are the same usable terminal device.
 
-The following remain OpenSSH features and must behave exactly as they do under
-`ssh`:
+The helper runs without privilege as the authenticated user. It starts a login
+shell with Crush's `TERM=xterm-256color` emulator baseline and
+`COLORTERM=truecolor`; it does not leak a local wrapper name such as
+`tmux-256color` into the remote PTY.
 
-- user and system configuration, `Include`, `Match`, and canonicalization;
-- agent use and forwarding, host-key checking, certificates, security keys, and
-  authentication prompts;
-- `ProxyCommand`, `ProxyJump`, port/socket forwarding, and connection sharing;
-- remote commands, subsystems, escape commands, stop/resume, signals, and exit
-  status; and
-- unknown future options when Crush cannot classify them safely.
+## Terminal and application behavior
 
-Crush directly executes OpenSSH for clearly noninteractive or semantically
-uncertain forms. This includes `-T`, `-N`, `-W`, `-G`, `-O`, background mode,
-forwarding-only sessions, a non-TTY caller, and malformed/unknown option shapes.
-Direct execution is a compatibility feature, not an error.
+The mobile helper emulates the remote terminal and synchronizes visible screen
+state. It supports primary/alternate screen, color/rendition, cursor and common
+input modes, resize, title, bell, terminal-generated PTY replies, and single- or
+wide-cell base characters. Combining marks and OSC 8 hyperlink metadata are not
+yet serialized; visible base text remains.
 
-## Terminals and applications
+Only the current visible screen is synchronized. As in Mosh, arbitrary local
+scrollback cannot be reconstructed from states the client never received. Use
+remote tmux history/copy mode for complete remote history.
 
-Crush does not replace `$TERM`, add a terminfo entry, or claim capabilities on
-the terminal's behalf. It preserves `TERM`, `COLORTERM`, `TERM_PROGRAM`, locale,
-and normal process environment.
+Prediction supports printable ASCII, space, overwrite-style backspace,
+conditional Enter and left/right cursor movement, Kitty printable-key encoding,
+and xterm modifyOtherKeys. Unicode input, paste, mouse/focus events, tmux
+prefixes, and other controls are sent immediately but not speculatively
+displayed.
 
-Automatic prediction is limited to recognized VT/xterm-style `TERM` families,
-including `xterm`, `screen`, and `tmux`. Unknown/custom terminal names use the
-raw relay. Prediction also assumes the conventional VT mode state at a normal
-shell-to-application handoff—the same entry state tmux relies on. If a custom
-launcher deliberately leaves unusual display modes or character sets active,
-use `CRUSH_PREDICT=off`.
-
-The byte relay supports any terminal sequence that OpenSSH can carry. Prediction
-is deliberately narrower and may turn off for:
-
-- terminals or sequences the shadow parser cannot model confidently;
-- non-ASCII or multi-cell input;
-- password/no-echo prompts;
-- alternate-screen transitions, full redraws, synchronized-update blocks, or
-  incomplete control strings; and
-- queue pressure, resize races, malformed data, or a disagreement with remote
-  output.
-
-Falling back affects only the local overlay. It does not alter application
-input/output.
+`CRUSH_PREDICT=off` disables all local prediction while retaining mobile screen
+state synchronization.
 
 ## Tmux
 
-Remote tmux is a release-blocking supported application. Required coverage
-includes:
+Remote tmux is a primary supported path, not a client-side parser exception.
+The helper sits outside tmux's client PTY and sees tmux's final authoritative
+screen. Tmux may consume an inner Codex/Claude synchronized update; Crush does
+not depend on that inner marker because it synchronizes tmux's resulting screen
+state.
 
-- attach, detach, nested sessions, windows, panes, resize, zoom, and status
-  redraws;
-- default and custom prefixes, including `C-a` and `C-g`, and prefix-free key
-  bindings;
-- copy/search/choose modes, prompts, popups, paste, mouse, focus, and synchronized
-  panes;
-- alternate-screen applications, Vim/Neovim, shells, secret prompts, and output
-  floods in another pane;
-- extended-key protocols, OSC hyperlinks/clipboard, DCS passthrough, terminal
-  queries and replies, synchronized updates, and pixel resize; and
-- physical terminal → Crush → remote tmux, local tmux → Crush → remote tmux, and
-  nested remote tmux.
+The client mirrors application cursor/keypad, bracketed paste, mouse, focus,
+alternate-screen, and Kitty keyboard modes. Prefix keys and pane input remain
+unaltered bytes. Attach/detach and process exit are reflected by the remote PTY
+lifecycle.
 
-Normal text entry in a tmux pane can be predicted after one confirmed echo.
-Prefix actions, copy mode, pane switches, prompts, popups, attach/detach, resize,
-and ambiguous redraws suspend prediction. After tmux produces a safe
-rendition-first redraw and normal pane input resumes, Crush automatically probes
-again. Until then it remains a byte-transparent raw relay.
+Every speculative character overwrites its target cell at an absolute
+coordinate. Existing cells to its right are never copied or shifted. Automated
+real-tmux coverage asserts that a right-side row decoration stays stationary and
+that no insert-character terminal operation is emitted.
 
-On resize, Crush intentionally does not erase an overlay at its old coordinates.
-A few plain speculative characters can therefore remain transiently if the
-resize interrupts a partially written frame; tmux's authoritative resize redraw
-replaces them while prediction remains disabled.
+Nested local tmux may not pass synchronized-update mode through to the physical
+terminal, but the changed-cell output remains correct; the outer tmux controls
+when it presents the completed local paint.
 
-An arbitrary printable `bind-key -n` cannot be known by a client-only predictor
-before tmux processes it. A plain speculative cell may appear briefly if the prior
-pane was trusted, but it must be removed on the first contradiction or deadline;
-the tmux action and final screen remain authoritative.
+Side-by-side remote panes are detected from tmux's visible vertical border run.
+Predicted wrapping and Enter stay within the active pane and do not address the
+divider or the status row below it. Moving or replacing the split invalidates
+the old pane anchor before another speculative paint.
 
-When Crush itself runs inside a local tmux, `pipe-pane` and raw terminal recorders
-may capture Crush's temporary overlay control sequences. Use
-`CRUSH_PREDICT=off` when a byte-exact recording of process output is required.
+## Coding agents
 
-## Known non-goals for version 1
+Continuous Codex/Claude output is coalesced into the newest server framebuffer
+rather than queued as every PTY byte. The client also drains each already-ready
+UDP burst before painting and skips all but its newest complete framebuffer.
+Remote truth and conditional predictions are composed before one minimal diff
+is generated, so a status redraw or delayed input-widget repaint does not erase,
+repaint, or roll the speculative suffix backward. Matching input normalizes from
+faint to authoritative style without a cursor rewind.
 
-- Reconnect, roaming, session persistence, or surviving a broken SSH transport.
-- Lower network latency for remote output; Crush can only avoid adding local
-  buffering.
-- A built-in SSH protocol, SSH server, tmux client, tmux control-mode renderer,
-  or remote tmux plugin.
-- Perfect prediction of arbitrary prompts, bindings, terminal applications, or
-  Unicode editing.
-- Replacing `scp`, `sftp`, `ssh-add`, `ssh-agent`, or `ssh-keygen`.
+Explicit synchronized Codex updates are never snapshotted halfway through. If
+an outer tmux removes those boundaries, the helper stabilizes cursor coordinates
+across forced progress frames and commits the final coordinate when output is
+quiet, preventing renderer-internal cursor motion from becoming visible UI.
+
+Applications that intentionally transform, reorder, or hide typed text may show
+a temporary prediction until an input barrier. Turn prediction off for modal or
+secret workflows where a temporary visual guess is undesirable.
+
+## Known mobile limitations
+
+- IPv6-only paths.
+- UDP tunneling through SSH jump/proxy hosts.
+- Mobile remote commands and subsystems.
+- Reattaching after the local Crush process exits.
+- Full local scrollback reconstruction.
+- Mixed client/helper protocol versions.
+- Complete combining-character, hyperlink, clipboard, and graphics protocols.
+
+Each limitation falls back to OpenSSH in `auto` when the invocation can do so
+before terminal takeover. A failure after an established mobile session is
+reported rather than silently starting a second shell.

@@ -6,7 +6,7 @@
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use zeroize::Zeroizing;
@@ -53,6 +53,11 @@ pub(crate) struct OutputObservation {
     pub(crate) safe_before: bool,
     pub(crate) safe_after: bool,
     pub(crate) had_control: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CellRegionSnapshot {
+    cells: Vec<Cell>,
 }
 
 pub(crate) struct ShadowTerminal {
@@ -117,6 +122,70 @@ impl ShadowTerminal {
             line: point.line.0,
             column: point.column.0,
         }
+    }
+
+    pub(crate) fn columns(&self) -> usize {
+        self.term.grid().columns()
+    }
+
+    pub(crate) fn cursor_after_cells(
+        &self,
+        anchor: CursorSnapshot,
+        cells: usize,
+    ) -> Option<CursorSnapshot> {
+        wrapped_cursor(anchor, cells, self.columns())
+    }
+
+    pub(crate) fn cursor_before_cell(&self, cursor: CursorSnapshot) -> Option<CursorSnapshot> {
+        if cursor.column != 0 {
+            return Some(CursorSnapshot {
+                line: cursor.line,
+                column: cursor.column - 1,
+            });
+        }
+        (cursor.line > 0).then(|| CursorSnapshot {
+            line: cursor.line - 1,
+            column: self.columns().saturating_sub(1),
+        })
+    }
+
+    pub(crate) fn snapshot_region(
+        &self,
+        anchor: CursorSnapshot,
+        width: usize,
+    ) -> Option<CellRegionSnapshot> {
+        if width == 0 || anchor.line < 0 {
+            return None;
+        }
+        let grid = self.term.grid();
+        let cells = (0..width)
+            .map(|offset| {
+                let cursor = wrapped_cursor(anchor, offset, grid.columns())?;
+                let line = usize::try_from(cursor.line).ok()?;
+                (line < grid.screen_lines())
+                    .then(|| grid[Point::new(Line(cursor.line), Column(cursor.column))].clone())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(CellRegionSnapshot { cells })
+    }
+
+    pub(crate) fn region_matches(
+        &self,
+        anchor: CursorSnapshot,
+        snapshot: &CellRegionSnapshot,
+    ) -> bool {
+        if anchor.line < 0 || snapshot.cells.is_empty() {
+            return false;
+        }
+        let grid = self.term.grid();
+        snapshot.cells.iter().enumerate().all(|(offset, cell)| {
+            wrapped_cursor(anchor, offset, grid.columns()).is_some_and(|cursor| {
+                usize::try_from(cursor.line)
+                    .ok()
+                    .is_some_and(|line| line < grid.screen_lines())
+                    && grid[Point::new(Line(cursor.line), Column(cursor.column))] == *cell
+            })
+        })
     }
 
     pub(crate) fn advance(&mut self, bytes: &[u8]) -> OutputObservation {
@@ -212,6 +281,10 @@ impl ShadowTerminal {
             && self.parser.sync_bytes_count() == 0
     }
 
+    pub(crate) fn native_cursor_visible(&self) -> bool {
+        self.term.mode().contains(TermMode::SHOW_CURSOR)
+    }
+
     fn advance_parser(&mut self, bytes: &[u8]) {
         if self.parser_utf8_carry_len == 0 {
             let carry_len = trailing_incomplete_utf8_len(bytes);
@@ -248,6 +321,99 @@ impl ShadowTerminal {
             return false;
         }
 
+        self.overlay_cells_are_safe(width)
+    }
+
+    pub(crate) fn can_overlay_fast(&self, width: usize) -> bool {
+        self.fast_overlay_blockers(width) == 0
+    }
+
+    pub(crate) fn fast_overlay_blockers(&self, width: usize) -> u16 {
+        let mut blockers = 0_u16;
+        blockers |= u16::from(width == 0);
+        blockers |= u16::from(!self.scanner.fast_overlay_state_is_safe()) << 1;
+        blockers |= u16::from(!self.scanner.is_ground()) << 2;
+        blockers |= u16::from(self.parser_utf8_carry_len != 0) << 3;
+        blockers |= u16::from(self.parser.sync_bytes_count() != 0) << 4;
+
+        let grid = self.term.grid();
+        let cursor = &grid.cursor;
+        let mode = *self.term.mode();
+        blockers |= u16::from(cursor.input_needs_wrap) << 5;
+        blockers |= u16::from(mode.contains(TermMode::INSERT)) << 6;
+        blockers |= u16::from(!mode.contains(TermMode::SHOW_CURSOR)) << 7;
+        blockers |= u16::from(cursor.template != Cell::default()) << 8;
+        let anchor = CursorSnapshot {
+            line: cursor.point.line.0,
+            column: cursor.point.column.0,
+        };
+        let invalid_span = width == 0
+            || wrapped_cursor(anchor, width - 1, grid.columns()).is_none_or(|end| {
+                usize::try_from(end.line)
+                    .ok()
+                    .is_none_or(|line| line >= grid.screen_lines())
+            });
+        blockers |= u16::from(invalid_span) << 9;
+        if !invalid_span {
+            blockers |= u16::from(!self.fast_overlay_span_is_safe(width)) << 10;
+        }
+        blockers
+    }
+
+    pub(crate) fn fast_overlay_underlay(&self, width: usize) -> Option<Zeroizing<Vec<u8>>> {
+        if self.fast_overlay_blockers(width) != 0 {
+            return None;
+        }
+
+        let grid = self.term.grid();
+        let anchor = self.cursor();
+        let mut underlay = Zeroizing::new(Vec::with_capacity(width));
+        for offset in 0..width {
+            let cursor = wrapped_cursor(anchor, offset, grid.columns())?;
+            let cell = &grid[Point::new(Line(cursor.line), Column(cursor.column))];
+            underlay.push(if *cell == Cell::default() {
+                b' '
+            } else {
+                u8::try_from(cell.c).ok()?
+            });
+        }
+        Some(underlay)
+    }
+
+    pub(crate) fn fast_scanner_blockers(&self) -> u8 {
+        self.scanner.fast_overlay_blockers()
+    }
+
+    /// Heuristic only: remote termios is not observable to a client wrapper.
+    pub(crate) fn likely_hidden_input(&self) -> bool {
+        let grid = self.term.grid();
+        let cursor = &grid.cursor;
+        if cursor.point.line.0 < 0 {
+            return false;
+        }
+
+        let mut line = Zeroizing::new(Vec::with_capacity(cursor.point.column.0));
+        for column in 0..cursor.point.column.0 {
+            let ch = grid[Point::new(cursor.point.line, Column(column))].c;
+            line.push(if ch.is_ascii() {
+                u8::try_from(ch.to_ascii_lowercase()).unwrap_or(b' ')
+            } else {
+                b' '
+            });
+        }
+
+        [b"password".as_slice(), b"passphrase", b"secret", b"token"]
+            .iter()
+            .any(|needle| line.windows(needle.len()).any(|window| window == *needle))
+            || line
+                .iter()
+                .copied()
+                .skip_while(u8::is_ascii_whitespace)
+                .take(b"login:".len())
+                .eq(b"login:".iter().copied())
+    }
+
+    fn overlay_cells_are_safe(&self, width: usize) -> bool {
         let grid = self.term.grid();
         let cursor = &grid.cursor;
         let mode = *self.term.mode();
@@ -269,6 +435,36 @@ impl ShadowTerminal {
             .all(|column| grid[Point::new(line, Column(column))] == Cell::default())
     }
 
+    fn fast_overlay_span_is_safe(&self, width: usize) -> bool {
+        let grid = self.term.grid();
+        let anchor = self.cursor();
+        let mut cells = (0..width).filter_map(|offset| {
+            let cursor = wrapped_cursor(anchor, offset, grid.columns())?;
+            Some(&grid[Point::new(Line(cursor.line), Column(cursor.column))])
+        });
+        if cells.clone().all(|cell| *cell == Cell::default()) {
+            return true;
+        }
+
+        self.cursor_follows_input_prompt()
+            && cells.clone().any(is_dim_ascii_placeholder_cell)
+            && cells.all(|cell| *cell == Cell::default() || is_dim_ascii_placeholder_cell(cell))
+    }
+
+    fn cursor_follows_input_prompt(&self) -> bool {
+        let grid = self.term.grid();
+        let cursor = &grid.cursor;
+        if cursor.point.line.0 < 0 {
+            return false;
+        }
+
+        (0..cursor.point.column.0)
+            .rev()
+            .map(|column| grid[Point::new(cursor.point.line, Column(column))].c)
+            .find(|ch| !ch.is_whitespace())
+            .is_some_and(|ch| matches!(ch, '>' | '›' | '❯' | '»' | ':' | '/' | '?'))
+    }
+
     /// Count a confirmed linear prefix written at `anchor`.
     pub(crate) fn confirmed_prefix(&self, anchor: CursorSnapshot, pending: &[u8]) -> usize {
         if pending.is_empty() || anchor.line < 0 {
@@ -282,18 +478,41 @@ impl ShadowTerminal {
             return 0;
         }
 
-        let line = Line(anchor.line);
         pending
             .iter()
             .enumerate()
             .take_while(|(offset, byte)| {
-                let column = anchor.column + *offset;
-                column < grid.columns()
-                    && (byte.is_ascii_graphic() || **byte == b' ')
-                    && grid[Point::new(line, Column(column))].c == char::from(**byte)
+                wrapped_cursor(anchor, *offset, grid.columns()).is_some_and(|cursor| {
+                    (byte.is_ascii_graphic() || **byte == b' ')
+                        && grid[Point::new(Line(cursor.line), Column(cursor.column))].c
+                            == char::from(**byte)
+                })
             })
             .count()
     }
+}
+
+fn wrapped_cursor(anchor: CursorSnapshot, cells: usize, columns: usize) -> Option<CursorSnapshot> {
+    if anchor.line < 0 || columns == 0 || anchor.column >= columns {
+        return None;
+    }
+    let linear_column = anchor.column.checked_add(cells)?;
+    let added_lines = i32::try_from(linear_column / columns).ok()?;
+    Some(CursorSnapshot {
+        line: anchor.line.checked_add(added_lines)?,
+        column: linear_column % columns,
+    })
+}
+
+fn is_dim_ascii_placeholder_cell(cell: &Cell) -> bool {
+    if !(cell.c.is_ascii_graphic() || cell.c == ' ') || !cell.flags.contains(Flags::DIM) {
+        return false;
+    }
+
+    let mut unstyled = cell.clone();
+    unstyled.c = ' ';
+    unstyled.flags.remove(Flags::DIM);
+    unstyled == Cell::default()
 }
 
 /// Return the length of a trailing, structurally valid partial UTF-8 scalar.
@@ -409,6 +628,10 @@ struct SafetyScanner {
     osc_command_complete: bool,
     osc8_uri_separator_seen: bool,
     osc8_uri_nonempty: bool,
+    dcs_sync_candidate: bool,
+    dcs_sync_invalid: bool,
+    dcs_sync_prefix: [u8; 3],
+    dcs_sync_prefix_len: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -645,6 +868,21 @@ impl SafetyScanner {
             && !self.model_tainted
     }
 
+    fn fast_overlay_state_is_safe(&self) -> bool {
+        self.fast_overlay_blockers() == 0
+    }
+
+    fn fast_overlay_blockers(&self) -> u8 {
+        let mut blockers = 0_u8;
+        blockers |= u8::from(self.parser_mode != ParserMode::Ansi);
+        blockers |= u8::from(!self.modes.all_overlay_relevant_known()) << 1;
+        blockers |= u8::from(!self.hyperlink_known) << 2;
+        blockers |= u8::from(self.hyperlink_active) << 3;
+        blockers |= u8::from(!self.charsets.active_is_ascii()) << 4;
+        blockers |= u8::from(self.model_tainted) << 5;
+        blockers
+    }
+
     #[allow(clippy::too_many_lines)]
     fn advance(&mut self, bytes: &[u8]) -> ScanResult {
         let mut result = ScanResult::default();
@@ -777,10 +1015,12 @@ impl SafetyScanner {
                             self.state = ScanState::Csi;
                         }
                         b']' => self.begin_string(ScanState::Osc),
-                        b'P' | b'_' | b'^' | b'X' => {
-                            // DCS, APC, PM, and SOS can carry terminal-specific
-                            // protocols (including graphics and tmux
-                            // passthrough) which the shadow cannot model.
+                        b'P' => {
+                            // Kitty advertises synchronized updates through DCS.
+                            self.begin_string(ScanState::String);
+                            self.dcs_sync_candidate = true;
+                        }
+                        b'_' | b'^' | b'X' => {
                             self.model_tainted = true;
                             self.begin_string(ScanState::String);
                         }
@@ -1019,7 +1259,7 @@ impl SafetyScanner {
                     result.had_control = true;
                     self.string_bytes += 1;
                     if byte == 0x07 {
-                        self.finish_string(true);
+                        self.finish_string(true, true);
                     } else if byte == 0x1b {
                         // Xterm dispatches OSC only after the complete ST
                         // terminator. The backend dispatches at bare ESC, so
@@ -1056,7 +1296,7 @@ impl SafetyScanner {
                 ScanState::OscEscape => {
                     result.had_control = true;
                     if byte == b'\\' {
-                        self.finish_string(true);
+                        self.finish_string(true, true);
                     } else {
                         // Xterm aborts the OSC while the backend may already
                         // have dispatched it. Preserve no trust across the
@@ -1070,15 +1310,24 @@ impl SafetyScanner {
                     self.string_bytes += 1;
                     if byte == 0x1b {
                         self.state = ScanState::StringEscape;
-                    } else if matches!(byte, 0x18 | 0x1a | 0x9c) {
-                        self.finish_string(false);
+                    } else if byte == 0x9c {
+                        self.finish_string(false, true);
+                    } else if matches!(byte, 0x18 | 0x1a) {
+                        self.finish_string(false, false);
+                    } else {
+                        self.record_dcs_sync_byte(byte);
                     }
                 }
                 ScanState::StringEscape => {
                     result.had_control = true;
-                    if matches!(byte, b'\\' | 0x18 | 0x1a | 0x9c) {
-                        self.finish_string(false);
+                    if matches!(byte, b'\\' | 0x9c) {
+                        self.finish_string(false, true);
+                    } else if matches!(byte, 0x18 | 0x1a) {
+                        self.finish_string(false, false);
                     } else if byte != 0x1b {
+                        if self.dcs_sync_candidate {
+                            self.dcs_sync_invalid = true;
+                        }
                         self.state = ScanState::String;
                     }
                 }
@@ -1124,6 +1373,7 @@ impl SafetyScanner {
         self.osc_command_complete = false;
         self.osc8_uri_separator_seen = false;
         self.osc8_uri_nonempty = false;
+        self.clear_dcs_sync_candidate();
         true
     }
 
@@ -1158,6 +1408,7 @@ impl SafetyScanner {
         self.alternate_state_known = true;
         self.in_alternate_screen = false;
         self.escape_intermediates.clear();
+        self.clear_dcs_sync_candidate();
     }
 
     fn invalidate_unknown_tab_motion(&mut self) {
@@ -1424,9 +1675,29 @@ impl SafetyScanner {
         self.osc_command_complete = false;
         self.osc8_uri_separator_seen = false;
         self.osc8_uri_nonempty = false;
+        self.clear_dcs_sync_candidate();
     }
 
-    fn finish_string(&mut self, validate_osc: bool) {
+    fn record_dcs_sync_byte(&mut self, byte: u8) {
+        if !self.dcs_sync_candidate {
+            return;
+        }
+        if self.dcs_sync_prefix_len == self.dcs_sync_prefix.len() {
+            self.dcs_sync_invalid = true;
+            return;
+        }
+        self.dcs_sync_prefix[self.dcs_sync_prefix_len] = byte;
+        self.dcs_sync_prefix_len += 1;
+    }
+
+    fn clear_dcs_sync_candidate(&mut self) {
+        self.dcs_sync_candidate = false;
+        self.dcs_sync_invalid = false;
+        self.dcs_sync_prefix.fill(0);
+        self.dcs_sync_prefix_len = 0;
+    }
+
+    fn finish_string(&mut self, validate_osc: bool, dispatched: bool) {
         if validate_osc && !known_nondisplay_osc(&self.osc_command) {
             self.model_tainted = true;
         }
@@ -1436,12 +1707,25 @@ impl SafetyScanner {
             self.hyperlink_known = true;
             self.hyperlink_active = self.osc8_uri_nonempty;
         }
+        if self.dcs_sync_candidate {
+            if dispatched
+                && !self.dcs_sync_invalid
+                && self.dcs_sync_prefix_len == self.dcs_sync_prefix.len()
+                && matches!(&self.dcs_sync_prefix, b"=1s" | b"=2s")
+            {
+                self.modes.synchronized_update_known = true;
+                self.modes.synchronized_update_active = self.dcs_sync_prefix == *b"=1s";
+            } else {
+                self.model_tainted = true;
+            }
+        }
         self.state = ScanState::Ground;
         self.string_bytes = 0;
         self.osc_command.clear();
         self.osc_command_complete = false;
         self.osc8_uri_separator_seen = false;
         self.osc8_uri_nonempty = false;
+        self.clear_dcs_sync_candidate();
     }
 }
 
@@ -1776,6 +2060,8 @@ fn supported_private_mode(mode: u16) -> bool {
             // only whether the terminal reports theme updates and has no
             // display state for the shadow to model.
             | 2031
+            // Tmux mode 7727 changes input encoding only.
+            | 7727
     )
 }
 
@@ -1862,6 +2148,103 @@ mod tests {
         shadow.advance(b"\x1b[m\x1b[2J\x1b[H");
         assert!(shadow.is_safe());
         assert!(!shadow.can_overlay(1));
+    }
+
+    #[test]
+    fn fast_overlay_accepts_an_ordinary_prompt_without_a_full_redraw() {
+        let mut shadow = ShadowTerminal::at_application_entry(TerminalSize::new(80, 24));
+        shadow.advance(b"host$ ");
+
+        assert!(!shadow.can_overlay(1));
+        assert!(shadow.can_overlay_fast(1));
+        assert_eq!(shadow.fast_overlay_underlay(3).unwrap().as_slice(), b"   ");
+    }
+
+    #[test]
+    fn fast_overlay_span_and_confirmation_cross_the_right_edge() {
+        let mut shadow = ShadowTerminal::at_application_entry(TerminalSize::new(8, 4));
+        shadow.advance(b"\x1b[1;7H");
+        let anchor = shadow.cursor();
+
+        assert!(shadow.can_overlay_fast(6));
+        assert_eq!(
+            shadow.fast_overlay_underlay(6).unwrap().as_slice(),
+            b"      "
+        );
+        let before = shadow.snapshot_region(anchor, 6).unwrap();
+
+        shadow.advance(b"abcdef");
+        assert_eq!(shadow.confirmed_prefix(anchor, b"abcdef"), 6);
+        assert!(!shadow.region_matches(anchor, &before));
+        assert_eq!(shadow.cursor(), CursorSnapshot { line: 1, column: 4 });
+        assert_eq!(
+            shadow.cursor_after_cells(anchor, 6),
+            Some(CursorSnapshot { line: 1, column: 4 })
+        );
+        assert_eq!(
+            shadow.cursor_before_cell(CursorSnapshot { line: 1, column: 0 }),
+            Some(CursorSnapshot { line: 0, column: 7 })
+        );
+    }
+
+    #[test]
+    fn fast_overlay_refuses_a_span_that_would_scroll_past_the_screen() {
+        let mut shadow = ShadowTerminal::at_application_entry(TerminalSize::new(8, 4));
+        shadow.advance(b"\x1b[4;8H");
+
+        assert!(shadow.can_overlay_fast(1));
+        assert!(!shadow.can_overlay_fast(2));
+        assert!(shadow.fast_overlay_underlay(2).is_none());
+    }
+
+    #[test]
+    fn fast_overlay_can_replace_a_dim_coding_agent_placeholder() {
+        let mut shadow = ShadowTerminal::at_application_entry(TerminalSize::new(80, 24));
+        shadow.advance(
+            "\x1b[10;1H\x1b[1m›\x1b[22m\x1b[10;3H\x1b[2mImplement {feature}\
+             \x1b[22m\x1b[10;3H"
+                .as_bytes(),
+        );
+
+        assert!(shadow.can_overlay_fast(10));
+        assert_eq!(
+            shadow.fast_overlay_underlay(10).unwrap().as_slice(),
+            b"Implement "
+        );
+    }
+
+    #[test]
+    fn fast_overlay_does_not_replace_real_tui_text_or_unprompted_dim_text() {
+        let mut real_text = ShadowTerminal::at_application_entry(TerminalSize::new(80, 24));
+        real_text.advance("\x1b[10;1H› \x1b[10;3Htyped text\x1b[10;3H".as_bytes());
+        assert!(!real_text.can_overlay_fast(1));
+
+        let mut unprompted = ShadowTerminal::at_application_entry(TerminalSize::new(80, 24));
+        unprompted.advance(b"\x1b[10;3H\x1b[2mplaceholder\x1b[22m\x1b[10;3H");
+        assert!(!unprompted.can_overlay_fast(1));
+
+        let mut extra_style = ShadowTerminal::at_application_entry(TerminalSize::new(80, 24));
+        extra_style
+            .advance("\x1b[10;1H› \x1b[10;3H\x1b[1;2mplaceholder\x1b[0m\x1b[10;3H".as_bytes());
+        assert!(!extra_style.can_overlay_fast(1));
+    }
+
+    #[test]
+    fn hidden_input_guard_recognizes_common_no_echo_prompts() {
+        for prompt in [
+            b"Password: ".as_slice(),
+            b"Enter passphrase: ",
+            b"API token: ",
+            b"  login: ",
+        ] {
+            let mut shadow = ShadowTerminal::at_application_entry(TerminalSize::new(80, 24));
+            shadow.advance(prompt);
+            assert!(shadow.likely_hidden_input(), "prompt={prompt:?}");
+        }
+
+        let mut shell = ShadowTerminal::at_application_entry(TerminalSize::new(80, 24));
+        shell.advance(b"user@host$ ");
+        assert!(!shell.likely_hidden_input());
     }
 
     #[test]
@@ -2264,7 +2647,7 @@ mod tests {
         let mut shadow = ShadowTerminal::new(TerminalSize::new(80, 24));
         shadow.advance(b"\x1b\x03\x1b<\x1bc");
         shadow.advance(b"\x1b[?1;6;7;12;25;1000;1002;1003;1004;1005;1006;1007;1042;2004;2031h");
-        shadow.advance(b"\x1b[?2004;2031l\x1b[4h\x1b[4l\x1b[20l");
+        shadow.advance(b"\x1b[?2004;2031l\x1b[?7727h\x1b[?7727l\x1b[4h\x1b[4l\x1b[20l");
         assert!(shadow.is_safe());
     }
 
@@ -2451,6 +2834,34 @@ mod tests {
         assert!(!shadow.is_safe());
         shadow.advance(b"\x1b\x03\x1b<\x1bc");
         assert!(shadow.is_safe());
+    }
+
+    #[test]
+    fn kitty_terminfo_sync_dcs_is_safe_only_after_the_matching_end() {
+        let mut shadow = ShadowTerminal::new(TerminalSize::new(20, 2));
+        shadow.advance(b"\x1b\x03\x1b<\x1bc");
+        assert!(shadow.is_safe());
+
+        shadow.advance(b"\x1bP=1s\x1b\\");
+        assert!(
+            !shadow.is_safe(),
+            "an active synchronized update must block overlays"
+        );
+        shadow.advance(b"update");
+        assert!(!shadow.is_safe());
+        shadow.advance(b"\x1bP=2s\x1b\\");
+        assert!(shadow.is_safe(), "the exact end control restores trust");
+
+        for invalid in [
+            b"\x1bP=0s\x1b\\".as_slice(),
+            b"\x1bP=1sx\x1b\\",
+            b"\x1bP=1s\x18",
+        ] {
+            let mut invalid_shadow = ShadowTerminal::new(TerminalSize::new(20, 2));
+            invalid_shadow.advance(b"\x1b\x03\x1b<\x1bc");
+            invalid_shadow.advance(invalid);
+            assert!(!invalid_shadow.is_safe(), "invalid DCS {invalid:?}");
+        }
     }
 
     #[test]
