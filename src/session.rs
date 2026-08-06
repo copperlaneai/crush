@@ -91,8 +91,14 @@ impl TuiFrameCoalescer {
         self.bytes.extend_from_slice(bytes);
     }
 
-    fn ready(&self, now: Instant, overlay_pending: bool) -> bool {
+    fn ready(&self, now: Instant, overlay_pending: bool, stream_closed: bool) -> bool {
         if self.bytes.is_empty() {
+            return false;
+        }
+        if stream_closed || self.bytes.len() >= SHADOW_BACKLOG_LIMIT {
+            return true;
+        }
+        if !terminal_output_at_boundary(&self.bytes) {
             return false;
         }
         !overlay_pending
@@ -102,7 +108,6 @@ impl TuiFrameCoalescer {
             || self
                 .first_at
                 .is_some_and(|first| now.duration_since(first) >= TUI_REPAINT_MAX)
-            || self.bytes.len() >= SHADOW_BACKLOG_LIMIT
     }
 
     fn take_into(&mut self, output: &mut Zeroizing<Vec<u8>>) -> (usize, Option<Duration>) {
@@ -118,6 +123,120 @@ impl TuiFrameCoalescer {
     fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
+
+    fn at_terminal_boundary(&self) -> bool {
+        terminal_output_at_boundary(&self.bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TerminalBoundaryState {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Csi {
+        parameters_start: usize,
+    },
+    Osc,
+    OscEscape,
+    String,
+    StringEscape,
+    Utf8(u8),
+}
+
+fn terminal_output_at_boundary(bytes: &[u8]) -> bool {
+    use TerminalBoundaryState::{
+        Csi, Escape, EscapeIntermediate, Ground, Osc, OscEscape, String as ControlString,
+        StringEscape, Utf8,
+    };
+
+    let mut state = Ground;
+    let mut synchronized = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        state = match state {
+            Ground => match byte {
+                0x1b => Escape,
+                0x90 | 0x98 | 0x9e | 0x9f => ControlString,
+                0x9b => Csi {
+                    parameters_start: index + 1,
+                },
+                0x9d => Osc,
+                0xc2..=0xdf => Utf8(1),
+                0xe0..=0xef => Utf8(2),
+                0xf0..=0xf4 => Utf8(3),
+                _ => Ground,
+            },
+            Escape => match byte {
+                b'[' => Csi {
+                    parameters_start: index + 1,
+                },
+                b']' => Osc,
+                b'P' | b'X' | b'^' | b'_' => ControlString,
+                0x1b => Escape,
+                0x20..=0x2f => EscapeIntermediate,
+                _ => Ground,
+            },
+            EscapeIntermediate => match byte {
+                0x1b => Escape,
+                0x30..=0x7e | 0x18 | 0x1a => Ground,
+                _ => EscapeIntermediate,
+            },
+            Csi { parameters_start } => match byte {
+                0x1b => Escape,
+                0x18 | 0x1a => Ground,
+                0x40..=0x7e => {
+                    let parameters = &bytes[parameters_start..index];
+                    let changes_sync = parameters.strip_prefix(b"?").is_some_and(|parameters| {
+                        parameters
+                            .split(|parameter| *parameter == b';')
+                            .any(|parameter| parameter == b"2026")
+                    });
+                    if changes_sync && matches!(byte, b'h' | b'l') {
+                        synchronized = byte == b'h';
+                    }
+                    Ground
+                }
+                _ => Csi { parameters_start },
+            },
+            Osc => match byte {
+                0x07 | 0x18 | 0x1a | 0x9c => Ground,
+                0x1b => OscEscape,
+                _ => Osc,
+            },
+            OscEscape => match byte {
+                b'\\' => Ground,
+                0x1b => OscEscape,
+                _ => Osc,
+            },
+            ControlString => match byte {
+                0x18 | 0x1a | 0x9c => Ground,
+                0x1b => StringEscape,
+                _ => ControlString,
+            },
+            StringEscape => match byte {
+                b'\\' => Ground,
+                0x1b => StringEscape,
+                _ => ControlString,
+            },
+            Utf8(remaining) => {
+                if (0x80..=0xbf).contains(&byte) {
+                    if remaining == 1 {
+                        Ground
+                    } else {
+                        Utf8(remaining - 1)
+                    }
+                } else {
+                    state = Ground;
+                    continue;
+                }
+            }
+        };
+        index += 1;
+    }
+    state == Ground && !synchronized
 }
 
 struct QueuedOutput {
@@ -1232,10 +1351,15 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                 }
             }
 
-            if tui_frame_coalescer.ready(
-                Instant::now(),
-                prediction_enabled && fast_prediction && display.has_displayed_overlay(),
-            ) {
+            let overlay_pending =
+                prediction_enabled && fast_prediction && display.has_displayed_overlay();
+            if controller_closed && overlay_pending && !tui_frame_coalescer.at_terminal_boundary() {
+                let _ = predictor.authoritative_change();
+                desired_overlay.zeroize();
+                echo_anchor = None;
+                display.clear()?;
+            }
+            if tui_frame_coalescer.ready(Instant::now(), overlay_pending, controller_closed) {
                 let (reads, elapsed) = tui_frame_coalescer.take_into(&mut tui_frame_buffer);
                 process_remote_output(
                     &tui_frame_buffer,
@@ -2952,12 +3076,13 @@ mod tests {
         let mut coalescer = TuiFrameCoalescer::default();
 
         coalescer.push(b"\x1b[?2026h\x1b[5;1HThinking\x1b[?20", 1, now);
-        assert!(!coalescer.ready(now, true));
+        assert!(!coalescer.ready(now, true, false));
 
         let completed_at = now + Duration::from_millis(1);
+        assert!(!coalescer.ready(completed_at + TUI_REPAINT_MAX, true, false));
         coalescer.push(b"26l", 1, completed_at);
-        assert!(!coalescer.ready(completed_at, true));
-        assert!(coalescer.ready(completed_at + TUI_REPAINT_QUIET, true));
+        assert!(!coalescer.ready(completed_at, true, false));
+        assert!(coalescer.ready(completed_at + TUI_REPAINT_QUIET, true, false));
         let mut frame = Zeroizing::new(Vec::with_capacity(REMOTE_READ_SIZE));
         let (reads, _) = coalescer.take_into(&mut frame);
         assert_eq!(frame.as_slice(), b"\x1b[?2026h\x1b[5;1HThinking\x1b[?2026l");
@@ -2966,13 +3091,43 @@ mod tests {
     }
 
     #[test]
+    fn terminal_boundary_rejects_split_controls_and_synchronized_updates() {
+        for (partial, complete) in [
+            (b"\x1b".as_slice(), b"\x1bc".as_slice()),
+            (b"\x1b[31".as_slice(), b"\x1b[31m".as_slice()),
+            (
+                b"\x1b]0;title\x1b".as_slice(),
+                b"\x1b]0;title\x1b\\".as_slice(),
+            ),
+            (
+                b"\x1bPpayload\x1b".as_slice(),
+                b"\x1bPpayload\x1b\\".as_slice(),
+            ),
+            (b"\xe2\x80".as_slice(), b"\xe2\x80\xba".as_slice()),
+            (
+                b"\x1b[?2026hframe".as_slice(),
+                b"\x1b[?2026hframe\x1b[?2026l".as_slice(),
+            ),
+            (
+                b"\x1b[?25;2026hframe".as_slice(),
+                b"\x1b[?25;2026hframe\x1b[?2026;25l".as_slice(),
+            ),
+        ] {
+            assert!(!terminal_output_at_boundary(partial), "{partial:?}");
+            assert!(terminal_output_at_boundary(complete), "{complete:?}");
+        }
+    }
+
+    #[test]
     fn tui_coalescer_does_not_flush_a_trailing_partial_repaint() {
         let now = Instant::now();
         let mut coalescer = TuiFrameCoalescer::default();
         coalescer.push(b"\x1b[?2026hfirst\x1b[?2026l\x1b[?2026hsecond", 1, now);
 
-        assert!(!coalescer.ready(now, true));
-        assert!(coalescer.ready(now + TUI_REPAINT_QUIET, true));
+        assert!(!coalescer.ready(now, true, false));
+        assert!(!coalescer.ready(now + TUI_REPAINT_MAX, true, false));
+        coalescer.push(b"\x1b[?2026l", 1, now + TUI_REPAINT_MAX);
+        assert!(coalescer.ready(now + TUI_REPAINT_MAX + TUI_REPAINT_QUIET, true, false));
     }
 
     #[test]
@@ -2980,12 +3135,12 @@ mod tests {
         let now = Instant::now();
         let mut coalescer = TuiFrameCoalescer::default();
         coalescer.push(b"\x1b[?2026hfirst\x1b[?2026l", 1, now);
-        assert!(!coalescer.ready(now, true));
+        assert!(!coalescer.ready(now, true, false));
 
         let second_at = now + TUI_REPAINT_QUIET / 2;
         coalescer.push(b"\x1b[?2026hsecond\x1b[?2026l", 1, second_at);
-        assert!(!coalescer.ready(now + TUI_REPAINT_QUIET, true));
-        assert!(coalescer.ready(second_at + TUI_REPAINT_QUIET, true));
+        assert!(!coalescer.ready(now + TUI_REPAINT_QUIET, true, false));
+        assert!(coalescer.ready(second_at + TUI_REPAINT_QUIET, true, false));
 
         let mut frames = Zeroizing::new(Vec::with_capacity(REMOTE_READ_SIZE));
         let (reads, _) = coalescer.take_into(&mut frames);

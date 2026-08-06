@@ -640,7 +640,7 @@ printf '\033[?2026h\033[2J\033[H\033[10;1H\033[1m\342\200\272\033[22m\033[10;3H\
 dd of="$TEST_INPUT_FILE" bs=1 count=1 2>/dev/null
 sleep 0.1
 printf '\033[?2026h\033[5;1H\033[2mThinking...\033[22m\033[10;3H\033[?20'
-sleep 0.005
+sleep 0.075
 printf '26l'
 : > "$TEST_STATUS_SENT"
 sleep 0.8
@@ -828,7 +828,7 @@ i=1
 while [ "$i" -le "$TEST_INPUT_LEN" ]; do
     dd bs=1 count=1 2>/dev/null >> "$TEST_INPUT_FILE"
     printf '\033[?2026h\033[5;1H\033[2mThinking %s\033[22m\033[10;3H\033[?20' "$i"
-    sleep 0.005
+    sleep 0.075
     printf '26l'
     i=$((i + 1))
 done
