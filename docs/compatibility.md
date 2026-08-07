@@ -62,9 +62,9 @@ input modes, resize, title, bell, terminal-generated PTY replies, and single- or
 wide-cell base characters. Combining marks and OSC 8 hyperlink metadata are not
 yet serialized; visible base text remains.
 
-Only the current visible screen is synchronized. As in Mosh, arbitrary local
-scrollback cannot be reconstructed from states the client never received. Use
-remote tmux history/copy mode for complete remote history.
+Only the current visible screen is synchronized. Arbitrary local scrollback
+cannot be reconstructed from states the client never received. Use remote tmux
+history/copy mode for complete remote history.
 
 Prediction supports printable ASCII, space, overwrite-style backspace,
 conditional Enter and left/right cursor movement, Kitty printable-key encoding,

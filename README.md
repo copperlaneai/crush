@@ -1,7 +1,7 @@
 # Crush
 
 **Crisp Remote Uninterrupted Shell** is a responsive remote terminal built on
-SSH authentication and Mosh-style screen synchronization.
+SSH authentication and encrypted screen-state synchronization.
 
 ```sh
 crush user@example.com

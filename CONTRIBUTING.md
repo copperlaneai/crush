@@ -12,8 +12,8 @@ changes with explicit invariants are preferred over broad rewrites.
   and [Testing](docs/testing.md).
 - Never add a reserved key, fabricated terminal reply, output batching timer,
   input re-encoding step, or code path where raw relay waits for prediction.
-- Do not copy code from Mosh or another project under an incompatible license.
-  Record design inspiration and provenance in the pull request.
+- Do not copy code from another project under an incompatible license. Record
+  design inspiration and provenance in the pull request.
 
 ## Development setup
 

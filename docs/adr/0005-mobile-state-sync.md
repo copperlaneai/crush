@@ -11,11 +11,11 @@ emulator. Reconciliation then exposes cursor rewinds or requires conservative
 prediction gaps. An SSH byte stream also delivers every obsolete intermediate
 coding-agent repaint in order.
 
-Mosh solves the broader transport problem with an unprivileged remote helper,
-encrypted UDP, a synchronized screen model, and speculative local echo. Mosh's
-default insertion prediction has an undesirable behavior: typing before
-existing cells copies the remainder of the row right. Its
-`--predict-overwrite` option avoids that shift.
+A mobile transport can solve the broader problem with an unprivileged remote
+helper, encrypted UDP, a synchronized screen model, and speculative local echo.
+Insert-style prediction has an undesirable behavior: typing before existing
+cells copies the remainder of the row right, so prediction must overwrite cells
+without shifting the row.
 
 ## Decision
 

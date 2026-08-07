@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Rebuild interactive login shells around an SSH-bootstrapped, unprivileged
-  remote helper and Mosh-style encrypted UDP state synchronization. Add
+  remote helper and encrypted UDP screen-state synchronization. Add
   ChaCha20-Poly1305 datagrams, independently LZ4-compressed framebuffer states,
   bounded fragmentation/reassembly, sequenced and retransmitted input, endpoint
   migration, resize, remote terminal replies, changed-cell rendering, terminal
@@ -20,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   latency tracing.
 - Make mobile prediction unconditionally overwrite-only. Every speculative
   character paints one absolute cell and never shifts the remainder of a row,
-  fixing Mosh's default insert-prediction movement around right prompts, tmux,
-  and coding-agent decorations. Decode Kitty/modifyOtherKeys printable input,
+  preventing insert-prediction movement around right prompts, tmux, and
+  coding-agent decorations. Decode Kitty/modifyOtherKeys printable input,
   suppress bracketed-paste prediction, preserve pending typing through unrelated
   redraws, and use remote PTY/screen context to disable covered secret prompts.
 - Compose mobile predictions into the candidate framebuffer before diffing,
@@ -66,8 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every key.
 - Coalesce already-readable PTY output into bounded 64 KiB terminal writes
   without delaying the first available byte when no prediction is pending.
-  While a fast overlay is pending, use slsh-style 16 ms quiet and 50 ms maximum
-  coalescing so intermediate repaint cursor positions are never rendered.
+  While a fast overlay is pending, use 16 ms quiet and 50 ms maximum coalescing
+  so intermediate repaint cursor positions are never rendered.
 - Validate synthetic fast frames at terminal-operation boundaries, retain each
   paint in one zeroized queue allocation, and drain it with one write. Resize
   or bounded lifecycle abandonment can finish a partially accepted SGR/cursor
@@ -77,12 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal/input transition arrives; timer expiry can no longer manufacture a
   cursor rollback during a network stall.
 - Carry fast-mode ASCII and its software cursor across physical row boundaries.
-  Use slsh-style absolute cell diffs inside a synchronized paint for every key,
-  never a relative backspace, so ordinary typing and terminal delayed-wrap
-  behavior cannot make the cursor jump backward. Cover the path through real
-  tmux with both xterm CSI and Kitty DCS synchronization. Feed local keys,
-  unrelated agent repaints, and acknowledgement frames to an independent
-  terminal one byte at a time and require its visible cursor never to reverse.
+  Use absolute cell diffs inside a synchronized paint for every key, never a
+  relative backspace, so ordinary typing and terminal delayed-wrap behavior
+  cannot make the cursor jump backward. Cover the path through real tmux with
+  both xterm CSI and Kitty DCS synchronization. Feed local keys, unrelated agent
+  repaints, and acknowledgement frames to an independent terminal one byte at a
+  time and require its visible cursor never to reverse.
 - Forward a newly read key to the SSH PTY in the same input-worker turn instead
   of waiting for another writable poll. Preserve fast-mode composition across
   temporary physical-terminal backpressure so a short output stall cannot

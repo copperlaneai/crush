@@ -125,9 +125,9 @@ The first state and size/alternate-screen transitions receive a full repaint.
 
 ## Overwrite-only local prediction
 
-Mosh's default predictor models shell insertion by shifting the remainder of a
-row right. That makes right prompts, tmux decorations, and coding-agent text move
-temporarily. Mosh's `--predict-overwrite` avoids it.
+Insert-style prediction shifts the remainder of a row right. That makes right
+prompts, tmux decorations, and coding-agent text move temporarily, so Crush uses
+overwrite-only prediction instead.
 
 Crush has no insert-style prediction. Every eligible character:
 

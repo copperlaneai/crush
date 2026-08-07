@@ -1724,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn mosh_style_cursor_actions_are_predicted_conditionally() {
+    fn cursor_actions_are_predicted_conditionally() {
         let base = frame("prompt", 6, 0);
         let mut predictor = OverwritePredictor::default();
         predictor.apply(InputAction::Print(b'x'), 1, &base);
