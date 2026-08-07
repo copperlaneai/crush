@@ -980,12 +980,12 @@ printf '\033[?2026l'
     );
 }
 
-fn assert_input_forward_latency(trace: &str, expected_keys: usize) {
+fn assert_input_forward_latency(trace: &str, expected_bytes: usize) {
     let mut latencies = trace_values_from_contents(trace, "input_forwarded", "latency_us");
     assert_eq!(
-        latencies.len(),
-        expected_keys,
-        "every independently read key must reach the SSH PTY: {trace}"
+        trace_byte_total(trace, "input_forwarded"),
+        expected_bytes as u64,
+        "every input byte must reach the SSH PTY: {trace}"
     );
     let maximum = latencies.iter().copied().max().unwrap_or_default();
     assert!(
@@ -995,16 +995,16 @@ fn assert_input_forward_latency(trace: &str, expected_keys: usize) {
     let median = percentile(&mut latencies, 50);
     let p99 = percentile(&mut latencies, 99);
     eprintln!(
-        "per-key SSH PTY forwarding: p50 {median} us, p99 {p99} us, max {maximum} us across {expected_keys} streamed keys"
+        "SSH PTY forwarding: p50 {median} us, p99 {p99} us, max {maximum} us across {expected_bytes} streamed bytes"
     );
 }
 
-fn assert_agent_render_latency(trace: &str, expected_keys: usize) {
+fn assert_agent_render_latency(trace: &str, expected_bytes: usize) {
     let mut latencies = trace_values_from_contents(trace, "prediction_rendered", "latency_us");
     assert_eq!(
-        latencies.len(),
-        expected_keys,
-        "every key must be rendered in its input observation turn: {trace}"
+        trace_byte_total(trace, "prediction_rendered"),
+        expected_bytes as u64,
+        "every input byte must render in its input observation turn: {trace}"
     );
     let maximum = latencies.iter().copied().max().unwrap_or_default();
     assert!(
@@ -1014,8 +1014,14 @@ fn assert_agent_render_latency(trace: &str, expected_keys: usize) {
     let median = percentile(&mut latencies, 50);
     let p99 = percentile(&mut latencies, 99);
     eprintln!(
-        "per-key coding-agent local echo: p50 {median} us, p99 {p99} us, max {maximum} us across {expected_keys} redraws"
+        "coding-agent local echo: p50 {median} us, p99 {p99} us, max {maximum} us across {expected_bytes} streamed bytes"
     );
+}
+
+fn trace_byte_total(trace: &str, event: &str) -> u64 {
+    trace_values_from_contents(trace, event, "bytes")
+        .into_iter()
+        .sum()
 }
 
 fn percentile(values: &mut [u64], percentile: usize) -> u64 {
