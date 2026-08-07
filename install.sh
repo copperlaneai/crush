@@ -5,8 +5,10 @@ set -eu
 repository='copperlaneai/crush'
 github_url="https://github.com/${repository}"
 version='latest'
-install_dir=${HOME:+"${HOME}/.local/bin"}
+default_install_dir=${HOME:+"${HOME}/.local/bin"}
+install_dir=$default_install_dir
 force=0
+modify_path=1
 
 usage() {
     cat <<'EOF'
@@ -18,6 +20,7 @@ Options:
   --version VERSION  Install an exact version (for example, 0.1.0 or v0.1.0)
   --dir DIRECTORY    Install directory (default: ~/.local/bin)
   --force            Replace an existing non-directory destination named crush
+  --no-modify-path   Do not add ~/.local/bin to the shell startup file
   -h, --help         Show this help
 
 The installer verifies the archive with SHA256SUMS. If cosign is available, it
@@ -53,6 +56,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --force)
             force=1
+            shift
+            ;;
+        --no-modify-path)
+            modify_path=0
             shift
             ;;
         -h | --help)
@@ -255,5 +262,50 @@ fi
 say "installed ${destination}"
 case ":${PATH:-}:" in
     *:"$install_dir":*) ;;
-    *) say "add ${install_dir} to PATH to invoke crush directly" ;;
+    *)
+        path_profile=''
+        path_line=''
+        if [ "$modify_path" -eq 1 ] && [ "$install_dir" = "$default_install_dir" ]; then
+            shell_name=${SHELL##*/}
+            case "$shell_name" in
+                zsh)
+                    path_profile="${ZDOTDIR:-$HOME}/.zshrc"
+                    path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+                    ;;
+                bash)
+                    if [ "$os" = 'Darwin' ]; then
+                        path_profile="${HOME}/.bash_profile"
+                    else
+                        path_profile="${HOME}/.bashrc"
+                    fi
+                    path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+                    ;;
+                fish)
+                    path_profile="${HOME}/.config/fish/config.fish"
+                    path_line="fish_add_path \"\$HOME/.local/bin\""
+                    ;;
+                *)
+                    path_profile="${HOME}/.profile"
+                    path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+                    ;;
+            esac
+
+            profile_directory=${path_profile%/*}
+            if mkdir -p "$profile_directory" &&
+                { [ ! -e "$path_profile" ] || [ -f "$path_profile" ]; } &&
+                ! awk -v line="$path_line" '$0 == line { found = 1 } END { exit found ? 0 : 1 }' \
+                    "$path_profile" 2>/dev/null; then
+                if [ -s "$path_profile" ]; then
+                    path_prefix='\n'
+                else
+                    path_prefix=''
+                fi
+                if printf '%b%s\n' "$path_prefix" "$path_line" >>"$path_profile"; then
+                    say "added ${install_dir} to PATH in ${path_profile}"
+                fi
+            fi
+        fi
+
+        say "restart your shell or add ${install_dir} to PATH to invoke crush directly"
+        ;;
 esac

@@ -94,7 +94,6 @@ CRUSH_TEST_ASSETS=$assets PATH=$test_path sh "${repository_root}/install.sh" \
     --version 9.8.7 --dir "$destination_dir" >/dev/null
 test "$(CRUSH_ACTION=version "${destination_dir}/crush")" = 'crush 9.8.7'
 
-# Even an existing Crush installation requires an explicit replacement decision.
 if CRUSH_TEST_ASSETS=$assets PATH=$test_path sh "${repository_root}/install.sh" \
     --version 9.8.7 --dir "$destination_dir" >/dev/null 2>&1; then
     printf 'installer replaced an existing Crush installation without --force\n' >&2
@@ -136,5 +135,31 @@ test "$("${destination_dir}/crush")" = 'unrelated program'
 CRUSH_TEST_ASSETS=$assets PATH=$test_path sh "${repository_root}/install.sh" \
     --version 9.8.7 --dir "$destination_dir" --force >/dev/null
 test "$(CRUSH_ACTION=version "${destination_dir}/crush")" = 'crush 9.8.7'
+
+profile_home="${test_root}/profile-home"
+mkdir -p "$profile_home"
+HOME=$profile_home ZDOTDIR='' SHELL=/bin/zsh CRUSH_TEST_ASSETS=$assets PATH=$test_path \
+    sh "${repository_root}/install.sh" --version 9.8.7 >/dev/null
+test "$(CRUSH_ACTION=version "${profile_home}/.local/bin/crush")" = 'crush 9.8.7'
+test "$(tail -n 1 "${profile_home}/.zshrc")" = \
+    "export PATH=\"\$HOME/.local/bin:\$PATH\""
+HOME=$profile_home ZDOTDIR='' SHELL=/bin/zsh CRUSH_TEST_ASSETS=$assets PATH=$test_path \
+    sh "${repository_root}/install.sh" --version 9.8.7 --force >/dev/null
+test "$(awk '/^export PATH=/ { count += 1 } END { print count + 0 }' \
+    "${profile_home}/.zshrc")" -eq 1
+
+no_path_home="${test_root}/no-path-home"
+mkdir -p "$no_path_home"
+HOME=$no_path_home ZDOTDIR='' SHELL=/bin/zsh CRUSH_TEST_ASSETS=$assets PATH=$test_path \
+    sh "${repository_root}/install.sh" --version 9.8.7 --no-modify-path >/dev/null
+test ! -e "${no_path_home}/.zshrc"
+
+pipe_home="${test_root}/pipe-home"
+pipe_destination="${pipe_home}/bin"
+mkdir -p "$pipe_destination"
+HOME=$pipe_home CRUSH_TEST_ASSETS=$assets PATH=$test_path \
+    sh -s -- --version 9.8.7 --dir "$pipe_destination" \
+    <"${repository_root}/install.sh" >/dev/null
+test "$(CRUSH_ACTION=version "${pipe_destination}/crush")" = 'crush 9.8.7'
 
 printf 'installer tests passed\n'

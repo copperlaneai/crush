@@ -164,8 +164,9 @@ jobs:
       - name: Check shell scripts
         run: |
           shellcheck install.sh scripts/*.sh
-          sh -n install.sh
-          sh -n scripts/package-release.sh
+          for script in install.sh scripts/*.sh; do
+            sh -n "$script"
+          done
 
       - name: Exercise installer argument handling
         run: |
@@ -195,3 +196,20 @@ jobs:
           test -f "$archive"
           test "$(tar -tzf "$archive" | LC_ALL=C sort)" = "$(printf '%s\n' \
             LICENSE-APACHE LICENSE-MIT README.md crush | LC_ALL=C sort)"
+
+      - name: Exercise release asset preparation
+        run: |
+          assets=target/release-assets-smoke
+          mkdir -p "$assets"
+          for target in \
+            aarch64-apple-darwin \
+            aarch64-unknown-linux-gnu \
+            aarch64-unknown-linux-musl \
+            x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu \
+            x86_64-unknown-linux-musl; do
+            touch "$assets/crush-0.1.0-$target.tar.gz"
+          done
+          scripts/prepare-release-assets.sh 0.1.0 "$assets"
+          test -x "$assets/crush-installer.sh"
+          test "$(wc -l <"$assets/SHA256SUMS")" -eq 7

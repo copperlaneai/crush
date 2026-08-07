@@ -13,7 +13,9 @@ release.
 3. Ensure `Cargo.toml` contains the same version and `Cargo.lock` is current.
 4. Run the required checks in [CONTRIBUTING.md](../CONTRIBUTING.md) on a clean
    tree.
-5. Create and push a signed annotated tag whose value exactly matches the Cargo
+5. Confirm the repository is public. The stable one-line installer URL cannot
+   be downloaded anonymously from a private repository.
+6. Create and push a signed annotated tag whose value exactly matches the Cargo
    version:
 
    ```sh
@@ -28,6 +30,10 @@ release. The tag must already exist and be annotated; the workflow never creates
 or moves it. A manual re-run must be dispatched with that tag selected as the
 workflow ref so the Sigstore identity remains bound to `refs/tags/VERSION`.
 
+`scripts/prepare-release-assets.sh` validates the complete target set, copies
+the stable installer asset, and creates the checksum manifest used by the
+release workflow.
+
 ## Release assets
 
 Each version publishes:
@@ -40,11 +46,18 @@ Each version publishes:
   - `x86_64-apple-darwin`
   - `aarch64-apple-darwin`
 - `SHA256SUMS`
+- `crush-installer.sh`
 - `crush-VERSION.spdx.json`
-- one `.sigstore.json` bundle beside every archive, checksum manifest, and SBOM.
+- one `.sigstore.json` bundle beside the installer, every archive, checksum
+  manifest, and SBOM.
 
 Every archive contains `crush`, `README.md`, `LICENSE-MIT`, and
-`LICENSE-APACHE` at its root.
+`LICENSE-APACHE` at its root. `crush-installer.sh` has a stable asset name so
+the latest release is installable with one command:
+
+```sh
+curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | sh
+```
 
 On Linux, `install.sh` always selects the static musl archive. GNU target
 archives remain available for explicit manual download and source-oriented
