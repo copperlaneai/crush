@@ -73,10 +73,13 @@ coordinates, and exact payload length before rendering. It generates its own
 bounded cursor/style sequences instead of forwarding arbitrary network bytes as
 terminal controls.
 
-Titles and bells remain remote-controlled terminal effects. Control bytes are
-removed from title text before producing OSC title output. Clipboard and color
-queries are answered by the helper with constrained values; arbitrary remote
-clipboard payload synchronization is not implemented in the first protocol.
+Titles, bells, and clipboard writes remain remote-controlled terminal effects.
+Control bytes are removed from title text before producing OSC title output.
+OSC 52 writes are authenticated, limited to 64 KiB of UTF-8 text, replay
+protected, and re-encoded before the client sends them to the local terminal.
+The local terminal remains responsible for deciding whether to accept them.
+Clipboard reads and color queries are answered by the helper with constrained
+values; the remote host cannot read the local clipboard through Crush.
 
 The legacy SSH relay intentionally remains byte-transparent and therefore has
 the same terminal-escape exposure as plain SSH.

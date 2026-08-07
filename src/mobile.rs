@@ -27,6 +27,7 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONDITIONAL_MISMATCH_SETTLE: Duration = Duration::from_millis(250);
 const CONDITIONAL_MAX_HOLD: Duration = Duration::from_secs(2);
+const CURSOR_MOTION_MAX_HOLD: Duration = Duration::from_millis(150);
 const MAX_PENDING_INPUTS: usize = 256;
 const MAX_NETWORK_DATAGRAMS_PER_TURN: usize = 512;
 
@@ -363,16 +364,10 @@ fn resolve_server(config: &Config, args: &[OsString], port: u16) -> io::Result<S
         return Err(io::Error::other("ssh -G could not resolve the destination"));
     }
     let config_text = String::from_utf8_lossy(&output.stdout);
-    if config_text.lines().any(|line| {
-        line.strip_prefix("proxyjump ")
-            .or_else(|| line.strip_prefix("proxycommand "))
-            .is_some_and(|value| value != "none")
-    }) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "direct Crush UDP is unavailable through an SSH proxy",
-        ));
-    }
+    resolve_server_address(&config_text, port)
+}
+
+fn resolve_server_address(config_text: &str, port: u16) -> io::Result<SocketAddr> {
     let hostname = config_text
         .lines()
         .find_map(|line| line.strip_prefix("hostname "))
@@ -718,6 +713,8 @@ struct ConditionalCell {
 struct OverwritePredictor {
     cells: Vec<ConditionalCell>,
     cursor: Option<(usize, usize)>,
+    suspended_cursor: Option<(usize, usize)>,
+    suspended_at: Option<Instant>,
     cursor_sequence: Option<u64>,
     cursor_predicted_at: Option<Instant>,
     handoff_sequence: Option<u64>,
@@ -752,6 +749,12 @@ impl OverwritePredictor {
         if !frame.prediction_allowed {
             self.clear();
             return;
+        }
+        if !frame.prediction_stable {
+            return;
+        }
+        if self.suspended_at.is_some() {
+            self.clear();
         }
         self.begin_context(frame);
         self.mismatch_since = None;
@@ -837,6 +840,21 @@ impl OverwritePredictor {
             return;
         }
         if self
+            .handoff_sequence
+            .is_some_and(|sequence| sequence <= frame.echo_ack)
+        {
+            self.clear();
+            return;
+        }
+        if !frame.prediction_stable {
+            self.suspend(now);
+            return;
+        }
+        if self.suspended_at.is_some() {
+            self.clear();
+            return;
+        }
+        if self
             .context
             .is_some_and(|context| context != ScreenContext::from(frame))
         {
@@ -844,13 +862,6 @@ impl OverwritePredictor {
             return;
         }
 
-        if self
-            .handoff_sequence
-            .is_some_and(|sequence| sequence <= frame.echo_ack)
-        {
-            self.clear();
-            return;
-        }
         let columns = usize::from(frame.columns);
         let lines = usize::from(frame.lines);
         if self
@@ -938,6 +949,12 @@ impl OverwritePredictor {
                 cursor: None,
             };
         }
+        if !frame.prediction_stable {
+            return PredictionOverlay {
+                cells: Vec::new(),
+                cursor: self.suspended_cursor,
+            };
+        }
         PredictionOverlay {
             cells: self
                 .cells
@@ -955,6 +972,8 @@ impl OverwritePredictor {
     fn clear(&mut self) {
         self.cells.clear();
         self.cursor = None;
+        self.suspended_cursor = None;
+        self.suspended_at = None;
         self.cursor_sequence = None;
         self.cursor_predicted_at = None;
         self.handoff_sequence = None;
@@ -962,6 +981,19 @@ impl OverwritePredictor {
         self.context = None;
         self.origin = None;
         self.region = None;
+    }
+
+    fn suspend(&mut self, now: Instant) {
+        let cursor = self.cursor.or(self.suspended_cursor);
+        let suspended_at = self.suspended_at.unwrap_or(now);
+        let handoff_sequence = self.handoff_sequence;
+        self.clear();
+        if now.saturating_duration_since(suspended_at) >= CURSOR_MOTION_MAX_HOLD {
+            return;
+        }
+        self.suspended_cursor = cursor;
+        self.suspended_at = Some(suspended_at);
+        self.handoff_sequence = handoff_sequence;
     }
 
     fn set_conditional_cursor(
@@ -1277,6 +1309,8 @@ mod tests {
             title: String::new(),
             bell: false,
             prediction_allowed: true,
+            prediction_stable: true,
+            clipboard: None,
             cells,
         }
     }
@@ -1305,6 +1339,8 @@ mod tests {
             title: String::new(),
             bell: false,
             prediction_allowed: true,
+            prediction_stable: true,
+            clipboard: None,
             cells,
         }
     }
@@ -1316,6 +1352,15 @@ mod tests {
         assert_eq!(
             parser.push(b"\x1b[27;2;65~"),
             vec![InputAction::Print(b'A')]
+        );
+    }
+
+    #[test]
+    fn proxied_ssh_bootstrap_can_use_an_independent_udp_route() {
+        let config = "hostname 127.0.0.1\nproxycommand aws ssm start-session\n";
+        assert_eq!(
+            resolve_server_address(config, 60_000).unwrap(),
+            "127.0.0.1:60000".parse().unwrap()
         );
     }
 
@@ -1488,6 +1533,82 @@ mod tests {
         predictor.reconcile(&alternate);
         assert!(predictor.overlay(&alternate).cells.is_empty());
         assert_eq!(predictor.overlay(&alternate).cursor, None);
+    }
+
+    #[test]
+    fn moving_coding_agent_input_row_suspends_prediction_until_stable() {
+        let base = split_pane_frame((1, 5), 0);
+        let mut predictor = OverwritePredictor::default();
+        predictor.apply(InputAction::Print(b'x'), 1, &base);
+        let initial_overlay = predictor.overlay(&base);
+        assert_eq!(initial_overlay.cursor, Some((1, 6)));
+        let mut renderer = ScreenRenderer::default();
+        let _ = renderer
+            .render(&base, &initial_overlay.cells, initial_overlay.cursor)
+            .unwrap();
+
+        let mut moving = split_pane_frame((1, 5), 1);
+        moving.prediction_stable = false;
+        predictor.reconcile(&moving);
+        predictor.apply(InputAction::Print(b'y'), 2, &moving);
+        let suspended = predictor.overlay(&moving);
+        assert!(suspended.cells.is_empty());
+        assert_eq!(suspended.cursor, Some((1, 6)));
+        let paint = renderer
+            .render(&moving, &suspended.cells, suspended.cursor)
+            .unwrap();
+        assert!(paint.ends_with(b"\x1b[0m\x1b[2;7H\x1b[?25h\x1b[?2026l"));
+
+        let stable = split_pane_frame((2, 8), 2);
+        predictor.reconcile(&stable);
+        predictor.apply(InputAction::Print(b'z'), 3, &stable);
+        let overlay = predictor.overlay(&stable);
+        assert_eq!(
+            overlay
+                .cells
+                .iter()
+                .map(|cell| (cell.line, cell.column, cell.byte))
+                .collect::<Vec<_>>(),
+            vec![(2, 8, b'z')]
+        );
+        assert_eq!(overlay.cursor, Some((2, 9)));
+    }
+
+    #[test]
+    fn prolonged_input_row_motion_releases_the_held_cursor() {
+        let base = split_pane_frame((1, 5), 0);
+        let mut predictor = OverwritePredictor::default();
+        predictor.apply(InputAction::Print(b'x'), 1, &base);
+        let predicted_at = predictor.cursor_predicted_at.unwrap();
+
+        let mut moving = split_pane_frame((1, 5), 1);
+        moving.prediction_stable = false;
+        predictor.reconcile_at(&moving, predicted_at + Duration::from_millis(10));
+        assert_eq!(predictor.overlay(&moving).cursor, Some((1, 6)));
+
+        let suspended_at = predictor.suspended_at.unwrap();
+        predictor.reconcile_at(&moving, suspended_at + CURSOR_MOTION_MAX_HOLD);
+        assert!(predictor.overlay(&moving).cells.is_empty());
+        assert_eq!(predictor.overlay(&moving).cursor, None);
+    }
+
+    #[test]
+    fn newline_handoff_cannot_stick_during_an_unstable_redraw() {
+        let base = split_pane_frame((1, 5), 0);
+        let mut predictor = OverwritePredictor::default();
+        predictor.apply(InputAction::Submit, 1, &base);
+        let predicted_at = predictor.cursor_predicted_at.unwrap();
+
+        let mut moving = split_pane_frame((1, 5), 1);
+        moving.echo_ack = 0;
+        moving.prediction_stable = false;
+        predictor.reconcile_at(&moving, predicted_at + Duration::from_millis(10));
+        assert_eq!(predictor.overlay(&moving).cursor, Some((2, 0)));
+
+        moving.echo_ack = 1;
+        predictor.reconcile_at(&moving, predicted_at + Duration::from_millis(60));
+        assert!(predictor.overlay(&moving).cells.is_empty());
+        assert_eq!(predictor.overlay(&moving).cursor, None);
     }
 
     #[test]

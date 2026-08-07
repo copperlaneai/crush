@@ -25,7 +25,7 @@ fn mobile_helper_round_trip_is_local_and_never_inserts_same_row_text() {
         "fixture-shell",
         "#!/bin/sh\n\
          /bin/stty echo\n\
-         printf '\\033[2J\\033[HCRUSH_MOBILE>      RIGHT\\033[1;14H'\n\
+         printf '\\033]52;;Y3J1c2ggY2xpcGJvYXJk\\007\\033[2J\\033[HCRUSH_MOBILE>      RIGHT\\033[1;14H'\n\
          while IFS= read -r line; do\n\
              if [ \"$line\" = quit ]; then exit 7; fi\n\
              printf '\\r\\nGOT:%s\\r\\nCRUSH_MOBILE>      RIGHT\\033[1;14H' \"$line\"\n\
@@ -75,6 +75,12 @@ fn mobile_helper_round_trip_is_local_and_never_inserts_same_row_text() {
 
     let observed = run.snapshot();
     assert!(observed.windows(5).any(|bytes| bytes == b"RIGHT"));
+    assert!(
+        observed
+            .windows(28)
+            .any(|bytes| bytes == b"\x1b]52;c;Y3J1c2ggY2xpcGJvYXJk\x07"),
+        "remote OSC 52 write was not forwarded to the local terminal"
+    );
     assert!(
         !observed.windows(3).any(|bytes| bytes == b"\x1b[@")
             && !observed.windows(4).any(|bytes| bytes == b"\x1b[1@"),
@@ -157,6 +163,7 @@ fn mobile_helper_preserves_overwrite_prediction_inside_real_tmux() {
     let mut run = PtyRun::spawn(command);
     run.wait_for(b"CRUSH_TMUX>", Duration::from_secs(10));
     run.wait_for(b"SIDE_PANE", Duration::from_secs(5));
+    assert_tmux_clipboard_sync(tmux.as_os_str(), &socket, &run);
     let before_prediction = run.snapshot().len();
     run.write_input(b"z");
     run.wait_for(b"\x1b[0;2", Duration::from_secs(2));
@@ -185,6 +192,18 @@ fn mobile_helper_preserves_overwrite_prediction_inside_real_tmux() {
     assert!(
         status.success(),
         "tmux-backed mobile session failed: {status}"
+    );
+}
+
+fn assert_tmux_clipboard_sync(tmux: &std::ffi::OsStr, socket: &str, run: &PtyRun) {
+    let clipboard = Command::new(tmux)
+        .args(["-L", socket, "set-buffer", "-w", "crush-mobile-clipboard"])
+        .status()
+        .expect("set remote tmux clipboard buffer");
+    assert!(clipboard.success(), "tmux clipboard command failed");
+    run.wait_for(
+        b"\x1b]52;c;Y3J1c2gtbW9iaWxlLWNsaXBib2FyZA==\x07",
+        Duration::from_secs(5),
     );
 }
 

@@ -6,15 +6,19 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+use base64::Engine as _;
+use zeroize::Zeroize;
 
-const FRAME_MAGIC: &[u8; 4] = b"CRF2";
-const FIXED_HEADER_LEN: usize = 36;
+const FRAME_MAGIC: &[u8; 4] = b"CRF3";
+const FIXED_HEADER_LEN: usize = 50;
 const CELL_BYTES: usize = 14;
 const MAX_CELLS: usize = 100_000;
-const MAX_FRAME_BYTES: usize = FIXED_HEADER_LEN + MAX_CELLS * CELL_BYTES + u16::MAX as usize;
+const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+const MAX_FRAME_BYTES: usize =
+    FIXED_HEADER_LEN + MAX_CELLS * CELL_BYTES + u16::MAX as usize + MAX_CLIPBOARD_BYTES;
 const COLOR_INDEXED: u32 = 1 << 30;
 const COLOR_RGB: u32 = 1 << 31;
 
@@ -62,6 +66,52 @@ pub(crate) struct WireCell {
     pub(crate) flags: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClipboardTarget {
+    Clipboard,
+    Selection,
+}
+
+impl ClipboardTarget {
+    fn from_wire(value: u8) -> io::Result<Self> {
+        match value {
+            1 => Ok(Self::Clipboard),
+            2 => Ok(Self::Selection),
+            _ => Err(invalid_frame("clipboard target is invalid")),
+        }
+    }
+
+    fn wire(self) -> u8 {
+        match self {
+            Self::Clipboard => 1,
+            Self::Selection => 2,
+        }
+    }
+
+    fn osc52(self) -> u8 {
+        match self {
+            Self::Clipboard => b'c',
+            Self::Selection => b'p',
+        }
+    }
+}
+
+impl From<ClipboardType> for ClipboardTarget {
+    fn from(value: ClipboardType) -> Self {
+        match value {
+            ClipboardType::Clipboard => Self::Clipboard,
+            ClipboardType::Selection => Self::Selection,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClipboardEvent {
+    pub(crate) id: u64,
+    pub(crate) target: ClipboardTarget,
+    pub(crate) text: String,
+}
+
 impl WireCell {
     fn from_cell(cell: &Cell) -> Self {
         Self {
@@ -96,6 +146,8 @@ pub(crate) struct WireFrame {
     pub(crate) title: String,
     pub(crate) bell: bool,
     pub(crate) prediction_allowed: bool,
+    pub(crate) prediction_stable: bool,
+    pub(crate) clipboard: Option<ClipboardEvent>,
     pub(crate) cells: Vec<WireCell>,
 }
 
@@ -122,6 +174,18 @@ impl WireFrame {
         let title_len = u16::try_from(title.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "terminal title is too long")
         })?;
+        let (clipboard_id, clipboard_target, clipboard) = match &self.clipboard {
+            Some(event) if event.id != 0 && event.text.len() <= MAX_CLIPBOARD_BYTES => {
+                (event.id, event.target.wire(), event.text.as_bytes())
+            }
+            Some(event) if event.id == 0 => {
+                return Err(invalid_frame("clipboard event identifier is invalid"));
+            }
+            Some(_) => return Err(invalid_frame("clipboard payload is too large")),
+            None => (0, 0, &[][..]),
+        };
+        let clipboard_len = u32::try_from(clipboard.len())
+            .map_err(|_| invalid_frame("clipboard payload is too large"))?;
         let expected_cells = usize::from(self.columns).saturating_mul(usize::from(self.lines));
         if self.cells.len() != expected_cells || expected_cells > MAX_CELLS {
             return Err(io::Error::new(
@@ -130,8 +194,9 @@ impl WireFrame {
             ));
         }
 
-        let mut raw =
-            Vec::with_capacity(FIXED_HEADER_LEN + title.len() + self.cells.len() * CELL_BYTES);
+        let mut raw = Vec::with_capacity(
+            FIXED_HEADER_LEN + title.len() + clipboard.len() + self.cells.len() * CELL_BYTES,
+        );
         raw.extend_from_slice(FRAME_MAGIC);
         raw.extend_from_slice(&self.columns.to_be_bytes());
         raw.extend_from_slice(&self.lines.to_be_bytes());
@@ -143,7 +208,12 @@ impl WireFrame {
         raw.extend_from_slice(&title_len.to_be_bytes());
         raw.push(u8::from(self.bell));
         raw.push(u8::from(self.prediction_allowed));
+        raw.extend_from_slice(&clipboard_id.to_be_bytes());
+        raw.extend_from_slice(&clipboard_len.to_be_bytes());
+        raw.push(clipboard_target);
+        raw.push(u8::from(self.prediction_stable));
         raw.extend_from_slice(title);
+        raw.extend_from_slice(clipboard);
         for cell in &self.cells {
             raw.extend_from_slice(&cell.codepoint.to_be_bytes());
             raw.extend_from_slice(&cell.foreground.to_be_bytes());
@@ -184,11 +254,28 @@ impl WireFrame {
         let title_len = usize::from(read_u16(raw, 32)?);
         let bell = raw[34] != 0;
         let prediction_allowed = raw[35] != 0;
+        let clipboard_id = read_u64(raw, 36)?;
+        let clipboard_len = usize::try_from(read_u32(raw, 44)?)
+            .map_err(|_| invalid_frame("clipboard payload is too large"))?;
+        let clipboard_target = raw[48];
+        let prediction_stable = raw[49] != 0;
+        if clipboard_len > MAX_CLIPBOARD_BYTES {
+            return Err(invalid_frame("clipboard payload is too large"));
+        }
+        let clipboard_metadata_valid = if clipboard_id == 0 {
+            clipboard_len == 0 && clipboard_target == 0
+        } else {
+            matches!(clipboard_target, 1 | 2)
+        };
+        if !clipboard_metadata_valid {
+            return Err(invalid_frame("clipboard metadata is invalid"));
+        }
         let cell_count = usize::from(columns).saturating_mul(usize::from(lines));
         if columns == 0 || lines == 0 || cell_count > MAX_CELLS {
             return Err(invalid_frame("framebuffer dimensions are invalid"));
         }
-        let cells_start = FIXED_HEADER_LEN.saturating_add(title_len);
+        let title_end = FIXED_HEADER_LEN.saturating_add(title_len);
+        let cells_start = title_end.saturating_add(clipboard_len);
         let expected_len = cells_start.saturating_add(cell_count.saturating_mul(CELL_BYTES));
         if raw.len() != expected_len {
             return Err(invalid_frame("framebuffer payload length is invalid"));
@@ -198,8 +285,18 @@ impl WireFrame {
         {
             return Err(invalid_frame("framebuffer cursor is outside the screen"));
         }
-        let title = String::from_utf8(raw[FIXED_HEADER_LEN..cells_start].to_vec())
+        let title = String::from_utf8(raw[FIXED_HEADER_LEN..title_end].to_vec())
             .map_err(|_| invalid_frame("terminal title is not UTF-8"))?;
+        let clipboard = if clipboard_id == 0 {
+            None
+        } else {
+            Some(ClipboardEvent {
+                id: clipboard_id,
+                target: ClipboardTarget::from_wire(clipboard_target)?,
+                text: String::from_utf8(raw[title_end..cells_start].to_vec())
+                    .map_err(|_| invalid_frame("clipboard payload is not UTF-8"))?,
+            })
+        };
         let mut cells = Vec::with_capacity(cell_count);
         for bytes in raw[cells_start..].chunks_exact(CELL_BYTES) {
             let cell = WireCell {
@@ -224,6 +321,8 @@ impl WireFrame {
             title,
             bell,
             prediction_allowed,
+            prediction_stable,
+            clipboard,
             cells,
         })
     }
@@ -234,6 +333,8 @@ struct CapturedEvents {
     pty_writes: Vec<u8>,
     title: String,
     bell: bool,
+    clipboard_sequence: u64,
+    clipboard: Option<ClipboardEvent>,
 }
 
 #[derive(Clone)]
@@ -253,6 +354,18 @@ impl EventListener for ScreenEventProxy {
             Event::Title(title) => events.title = title,
             Event::ResetTitle => events.title.clear(),
             Event::Bell => events.bell = true,
+            Event::ClipboardStore(target, text) if text.len() <= MAX_CLIPBOARD_BYTES => {
+                if let Some(id) = events.clipboard_sequence.checked_add(1) {
+                    events.clipboard_sequence = id;
+                    if let Some(mut previous) = events.clipboard.replace(ClipboardEvent {
+                        id,
+                        target: target.into(),
+                        text,
+                    }) {
+                        previous.text.zeroize();
+                    }
+                }
+            }
             Event::ClipboardLoad(_, formatter) => {
                 events
                     .pty_writes
@@ -307,6 +420,7 @@ impl RemoteScreen {
         };
         let config = Config {
             scrolling_history: 0,
+            osc52: Osc52::OnlyCopy,
             ..Config::default()
         };
         Self {
@@ -361,6 +475,22 @@ impl RemoteScreen {
         )
     }
 
+    pub(crate) fn acknowledge_clipboard(&self, id: u64) {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if events
+            .clipboard
+            .as_ref()
+            .is_some_and(|clipboard| clipboard.id == id)
+        {
+            if let Some(mut clipboard) = events.clipboard.take() {
+                clipboard.text.zeroize();
+            }
+        }
+    }
+
     pub(crate) fn snapshot(&self, input_ack: u64, echo_ack: u64) -> WireFrame {
         let grid = self.term.grid();
         let columns = grid.columns();
@@ -392,6 +522,8 @@ impl RemoteScreen {
             title: events.title.clone(),
             bell: std::mem::take(&mut events.bell),
             prediction_allowed: self.prediction_allowed(),
+            prediction_stable: true,
+            clipboard: events.clipboard.clone(),
             cells,
         }
     }
@@ -429,6 +561,7 @@ pub(crate) struct ScreenRenderer {
     scratch: Option<WireFrame>,
     applied_modes: u32,
     title: String,
+    last_clipboard_id: u64,
 }
 
 impl ScreenRenderer {
@@ -457,12 +590,25 @@ impl ScreenRenderer {
             })
             && composed.title == self.title
             && !composed.bell;
+        let clipboard = frame
+            .clipboard
+            .as_ref()
+            .filter(|event| event.id > self.last_clipboard_id);
         if unchanged {
             self.scratch = self.previous.replace(composed);
-            return Ok(Vec::new());
+            let mut output = Vec::new();
+            if let Some(event) = clipboard {
+                append_clipboard(&mut output, event);
+                self.last_clipboard_id = event.id;
+            }
+            return Ok(output);
         }
 
         let mut output = Vec::with_capacity(composed.cells.len().saturating_add(512));
+        if let Some(event) = clipboard {
+            append_clipboard(&mut output, event);
+            self.last_clipboard_id = event.id;
+        }
         output.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
         append_mode_changes(&mut output, self.applied_modes, composed.modes);
         if full {
@@ -555,6 +701,18 @@ impl ScreenRenderer {
             .and_then(|previous| previous.cells.get(index))
             != frame.cells.get(index)
     }
+}
+
+fn append_clipboard(output: &mut Vec<u8>, event: &ClipboardEvent) {
+    output.extend_from_slice(b"\x1b]52;");
+    output.push(event.target.osc52());
+    output.push(b';');
+    output.extend_from_slice(
+        base64::engine::general_purpose::STANDARD
+            .encode(event.text.as_bytes())
+            .as_bytes(),
+    );
+    output.push(0x07);
 }
 
 fn compose_frame(
@@ -765,15 +923,119 @@ mod tests {
             title: String::new(),
             bell: false,
             prediction_allowed: true,
+            prediction_stable: true,
+            clipboard: None,
             cells,
         }
     }
 
     #[test]
     fn frame_round_trips_through_bounded_compression() {
-        let frame = plain_frame("hello", 5);
+        let mut frame = plain_frame("hello", 5);
+        frame.clipboard = Some(ClipboardEvent {
+            id: 7,
+            target: ClipboardTarget::Clipboard,
+            text: "copied text".to_owned(),
+        });
+        frame.prediction_stable = false;
         let encoded = frame.encode_compressed().unwrap();
         assert_eq!(WireFrame::decode_compressed(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn remote_osc52_write_is_captured_until_its_frame_is_acknowledged() {
+        let size = ScreenSize::checked(20, 3).unwrap();
+        let mut screen = RemoteScreen::new(size);
+        screen.advance(b"\x1b]52;;Zmlyc3Q=\x07");
+        let first = screen.snapshot(0, 0).clipboard.unwrap();
+        assert_eq!(first.text, "first");
+        assert_eq!(first.target, ClipboardTarget::Clipboard);
+
+        screen.advance(b"\x1b]52;p;c2Vjb25k\x07");
+        let second = screen.snapshot(0, 0).clipboard.unwrap();
+        assert!(second.id > first.id);
+        assert_eq!(second.text, "second");
+        assert_eq!(second.target, ClipboardTarget::Selection);
+
+        screen.acknowledge_clipboard(first.id);
+        assert_eq!(screen.snapshot(0, 0).clipboard.unwrap().id, second.id);
+        screen.acknowledge_clipboard(second.id);
+        assert!(screen.snapshot(0, 0).clipboard.is_none());
+    }
+
+    #[test]
+    fn oversized_clipboard_write_is_discarded() {
+        let size = ScreenSize::checked(20, 3).unwrap();
+        let screen = RemoteScreen::new(size);
+        let proxy = ScreenEventProxy {
+            events: Arc::clone(&screen.events),
+            size: Arc::clone(&screen.size),
+        };
+        proxy.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "x".repeat(MAX_CLIPBOARD_BYTES + 1),
+        ));
+        assert!(screen.snapshot(0, 0).clipboard.is_none());
+    }
+
+    #[test]
+    fn remote_clipboard_reads_are_disabled() {
+        let size = ScreenSize::checked(20, 3).unwrap();
+        let mut screen = RemoteScreen::new(size);
+        screen.advance(b"\x1b]52;c;?\x07");
+        assert!(screen.take_pty_writes().is_empty());
+        assert!(screen.snapshot(0, 0).clipboard.is_none());
+    }
+
+    #[test]
+    fn clipboard_output_is_validated_and_emitted_only_once() {
+        let mut frame = plain_frame("prompt", 6);
+        frame.clipboard = Some(ClipboardEvent {
+            id: 1,
+            target: ClipboardTarget::Clipboard,
+            text: "copied text".to_owned(),
+        });
+        let mut renderer = ScreenRenderer::default();
+        let first = renderer.render(&frame, &[], None).unwrap();
+        assert!(
+            first
+                .windows(24)
+                .any(|bytes| bytes == b"\x1b]52;c;Y29waWVkIHRleHQ=\x07")
+        );
+        assert!(renderer.render(&frame, &[], None).unwrap().is_empty());
+
+        frame.clipboard = Some(ClipboardEvent {
+            id: 2,
+            target: ClipboardTarget::Selection,
+            text: String::new(),
+        });
+        assert_eq!(
+            renderer.render(&frame, &[], None).unwrap(),
+            b"\x1b]52;p;\x07"
+        );
+    }
+
+    #[test]
+    fn malformed_clipboard_metadata_and_payload_are_rejected() {
+        let mut frame = plain_frame("hello", 5);
+        frame.clipboard = Some(ClipboardEvent {
+            id: 1,
+            target: ClipboardTarget::Clipboard,
+            text: "x".to_owned(),
+        });
+        let encoded = frame.encode_compressed().unwrap();
+        let raw = lz4_flex::decompress_size_prepended(&encoded).unwrap();
+
+        let mut invalid_target = raw.clone();
+        invalid_target[48] = 3;
+        assert!(WireFrame::decode(&invalid_target).is_err());
+
+        let mut invalid_utf8 = raw;
+        invalid_utf8[FIXED_HEADER_LEN] = 0xff;
+        assert!(WireFrame::decode(&invalid_utf8).is_err());
+
+        frame.clipboard.as_mut().unwrap().text = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
+        assert!(frame.encode_compressed().is_err());
     }
 
     #[test]

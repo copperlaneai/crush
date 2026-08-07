@@ -9,7 +9,8 @@ the fastest transport compatible with the requested operation.
 | --- | --- |
 | Interactive login shell, helper installed, direct IPv4 UDP | Mobile state sync |
 | Interactive login shell without helper/UDP | OpenSSH PTY relay |
-| `ProxyJump` or `ProxyCommand` | OpenSSH PTY relay |
+| SSH proxy bootstrap with independently reachable IPv4 UDP | Mobile state sync |
+| SSH proxy bootstrap without direct UDP | OpenSSH PTY relay |
 | Remote command with explicit `-t` | OpenSSH PTY relay |
 | Noninteractive command | Direct OpenSSH execution |
 | Forwarding, subsystem, multiplex control, `-G`, `-V`, `-T` | Direct OpenSSH execution |
@@ -37,7 +38,8 @@ version until protocol negotiation supports mixed versions.
 
 ## Mobile prerequisites
 
-- `crush` is available in remote `PATH`, or `CRUSH_SERVER` names its path.
+- The helper is installed at `~/.local/bin/crush`, or `CRUSH_SERVER` names its
+  path.
 - The SSH destination resolves to a directly reachable IPv4 address.
 - A return UDP flow to the helper's configured port/range is permitted
   (`60000:61000` by default).
@@ -83,6 +85,11 @@ alternate-screen, and Kitty keyboard modes. Prefix keys and pane input remain
 unaltered bytes. Attach/detach and process exit are reflected by the remote PTY
 lifecycle.
 
+Tmux OSC 52 clipboard writes are synchronized to the local terminal. This
+restores `set-clipboard` workflows such as copy-on-selection while leaving the
+local terminal's clipboard policy in control. Remote clipboard reads remain
+disabled.
+
 Every speculative character overwrites its target cell at an absolute
 coordinate. Existing cells to its right are never copied or shifted. Automated
 real-tmux coverage asserts that a right-side row decoration stays stationary and
@@ -111,6 +118,11 @@ Explicit synchronized Codex updates are never snapshotted halfway through. If
 an outer tmux removes those boundaries, the helper stabilizes cursor coordinates
 across forced progress frames and commits the final coordinate when output is
 quiet, preventing renderer-internal cursor motion from becoming visible UI.
+Prediction pauses while a progress repaint relocates the input cursor to a
+different row, then resumes after that row repeats or output settles. Same-row
+typing and echo stay speculative during continuous output. A newline
+acknowledgement releases the local cursor immediately, and an unstable cursor
+hold has a short upper bound.
 
 Applications that intentionally transform, reorder, or hide typed text may show
 a temporary prediction until an input barrier. Turn prediction off for modal or
@@ -119,12 +131,12 @@ secret workflows where a temporary visual guess is undesirable.
 ## Known mobile limitations
 
 - IPv6-only paths.
-- UDP tunneling through SSH jump/proxy hosts.
+- UDP tunneling through SSH jump/proxy hosts when no independent route exists.
 - Mobile remote commands and subsystems.
 - Reattaching after the local Crush process exits.
 - Full local scrollback reconstruction.
 - Mixed client/helper protocol versions.
-- Complete combining-character, hyperlink, clipboard, and graphics protocols.
+- Complete combining-character, hyperlink, clipboard-read, and graphics protocols.
 
 Each limitation falls back to OpenSSH in `auto` when the invocation can do so
 before terminal takeover. A failure after an established mobile session is

@@ -67,6 +67,7 @@ pub(crate) fn run_server(port_range: PortRange) -> io::Result<u8> {
         latest_resize: 0,
         frame_id: 0,
         last_acked_frame: 0,
+        last_frame_clipboard: None,
         last_frame: Vec::new(),
         last_frame_sent: Instant::now(),
         last_peer_packet: Instant::now(),
@@ -141,6 +142,7 @@ struct ServerSession<'a> {
     latest_resize: u64,
     frame_id: u64,
     last_acked_frame: u64,
+    last_frame_clipboard: Option<(u64, u64)>,
     last_frame: Vec<Vec<u8>>,
     last_frame_sent: Instant,
     last_peer_packet: Instant,
@@ -193,6 +195,9 @@ impl CursorStabilizer {
             return false;
         }
         if let Some(presented) = self.presented {
+            if presented.line != current.line {
+                frame.prediction_stable = false;
+            }
             presented.apply(frame);
         }
         true
@@ -306,6 +311,12 @@ impl ServerSession<'_> {
                 PacketKind::Resize => self.accept_resize(packet.sequence, &packet.payload)?,
                 PacketKind::FrameAck => {
                     self.last_acked_frame = self.last_acked_frame.max(packet.sequence);
+                    if let Some((frame_id, clipboard_id)) = self.last_frame_clipboard {
+                        if packet.sequence >= frame_id {
+                            self.screen.acknowledge_clipboard(clipboard_id);
+                            self.last_frame_clipboard = None;
+                        }
+                    }
                 }
                 PacketKind::End => {
                     self.send_close(0);
@@ -402,6 +413,10 @@ impl ServerSession<'_> {
         self.frame_id = self.frame_id.saturating_add(1);
         let mut frame = self.screen.snapshot(self.input_ack, self.echo_ack);
         let cursor_settle_pending = self.cursor_stabilizer.compose(&mut frame, readiness);
+        self.last_frame_clipboard = frame
+            .clipboard
+            .as_ref()
+            .map(|clipboard| (self.frame_id, clipboard.id));
         let compressed = frame.encode_compressed()?;
         self.last_frame = seal_frame(&self.crypto, self.frame_id, &compressed)?;
         self.resend_latest_frame()?;
@@ -762,6 +777,7 @@ mod tests {
         let mut stabilizer = CursorStabilizer::default();
         let mut initial = cursor_frame(2, 4);
         assert!(!stabilizer.compose(&mut initial, FrameReadiness::Settled));
+        assert!(initial.prediction_allowed);
 
         let mut first_partial = cursor_frame(7, 1);
         assert!(stabilizer.compose(&mut first_partial, FrameReadiness::Progress));
@@ -769,6 +785,7 @@ mod tests {
             (first_partial.cursor_line, first_partial.cursor_column),
             (2, 4)
         );
+        assert!(!first_partial.prediction_stable);
 
         let mut second_partial = cursor_frame(5, 18);
         assert!(stabilizer.compose(&mut second_partial, FrameReadiness::Progress));
@@ -776,18 +793,35 @@ mod tests {
             (second_partial.cursor_line, second_partial.cursor_column),
             (2, 4)
         );
+        assert!(!second_partial.prediction_stable);
 
         let mut repeated = cursor_frame(5, 18);
         assert!(stabilizer.compose(&mut repeated, FrameReadiness::Progress));
+        assert!(!repeated.prediction_stable);
         let mut repeated = cursor_frame(5, 18);
         assert!(stabilizer.compose(&mut repeated, FrameReadiness::Progress));
+        assert!(!repeated.prediction_stable);
         let mut repeated = cursor_frame(5, 18);
         assert!(!stabilizer.compose(&mut repeated, FrameReadiness::Progress));
         assert_eq!((repeated.cursor_line, repeated.cursor_column), (5, 18));
+        assert!(repeated.prediction_stable);
 
         let mut completed = cursor_frame(8, 3);
         assert!(!stabilizer.compose(&mut completed, FrameReadiness::Settled));
         assert_eq!((completed.cursor_line, completed.cursor_column), (8, 3));
+        assert!(completed.prediction_stable);
+    }
+
+    #[test]
+    fn same_row_echo_motion_remains_prediction_eligible() {
+        let mut stabilizer = CursorStabilizer::default();
+        let mut initial = cursor_frame(2, 4);
+        assert!(!stabilizer.compose(&mut initial, FrameReadiness::Settled));
+
+        let mut echo = cursor_frame(2, 5);
+        assert!(stabilizer.compose(&mut echo, FrameReadiness::Progress));
+        assert_eq!((echo.cursor_line, echo.cursor_column), (2, 4));
+        assert!(echo.prediction_stable);
     }
 
     #[test]

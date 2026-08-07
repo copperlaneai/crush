@@ -97,8 +97,9 @@ At 4 ms output quiet or a 16 ms frame deadline, the helper captures:
 - cursor position and visibility;
 - terminal input modes, title, and bell state;
 - latest accepted input sequence;
-- a deliberately delayed echo-validation sequence; and
-- whether the current screen context permits speculative echo.
+- a deliberately delayed echo-validation sequence;
+- whether the current screen context permits speculative echo; and
+- whether the input row is stable enough for a new speculative paint.
 
 States are LZ4-compressed independently. Under acknowledgement backlog the frame
 interval expands to 33 ms, and unacknowledged latest state is retried. Because a
@@ -108,8 +109,11 @@ coding-agent paints and display the newest complete screen.
 The client first composes remote truth and every still-valid conditional cell
 into one candidate framebuffer. It compares that candidate with the previously
 displayed candidate and emits only changed cell runs, plus terminal mode
-changes, inside one synchronized update. The first state and
-size/alternate-screen transitions receive a full repaint.
+changes, inside one synchronized update. If a streaming repaint relocates the
+input row, speculative cells are suspended while the visible cursor briefly
+remains at its last forward position. A newline handoff or a short deadline
+returns control to the authoritative cursor even if the repaint keeps moving.
+The first state and size/alternate-screen transitions receive a full repaint.
 
 ## Overwrite-only local prediction
 

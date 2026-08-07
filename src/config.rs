@@ -162,7 +162,7 @@ impl Config {
 
         let server_program = match get(CRUSH_SERVER) {
             Some(value) => nonempty(CRUSH_SERVER, value, "a non-empty remote command")?,
-            None => OsString::from("crush"),
+            None => OsString::from("$HOME/.local/bin/crush"),
         };
 
         let port_range = match get(CRUSH_PORT) {
@@ -298,7 +298,7 @@ mod tests {
                 mode: Mode::Auto,
                 prediction: Prediction::Auto,
                 transport: Transport::Auto,
-                server_program: OsString::from("crush"),
+                server_program: OsString::from("$HOME/.local/bin/crush"),
                 port_range: PortRange::default(),
                 trace: None,
                 action: None,
