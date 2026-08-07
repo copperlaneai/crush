@@ -1353,7 +1353,7 @@ fn poll_one(fd: RawFd, events: libc::c_short, timeout: Duration) -> io::Result<(
         revents: 0,
     }];
     poll(&mut pollfd, timeout)?;
-    if pollfd[0].revents & events == 0 {
+    if pollfd[0].revents & (events | libc::POLLHUP) == 0 {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "timed out waiting for SSH bootstrap",
