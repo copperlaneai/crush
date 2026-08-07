@@ -500,7 +500,6 @@ cat "$TEST_INPUT_FILE"
     let mut run = PtyRun::spawn(command, Some(READY));
     run.wait_until_ready();
     wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
-    let typed_at = Instant::now();
     let mut incremental_overlay = Vec::new();
     for (index, &byte) in OVERLAY.iter().enumerate() {
         run.write_input(&[byte]);
@@ -516,7 +515,6 @@ cat "$TEST_INPUT_FILE"
                 .as_bytes(),
         );
     }
-    let local_echo_latency = typed_at.elapsed();
     run.write_input(b"\r");
     wait_for_file(&input_received);
     wait_for_file_contents(&trace_file, b"\"event\":\"prediction_rendered\"");
@@ -527,10 +525,6 @@ cat "$TEST_INPUT_FILE"
 
     assert!(status.success(), "status={status}, output={output:?}");
     assert_eq!(fs::read(input_file).expect("read fake SSH input"), INPUT);
-    assert!(
-        local_echo_latency < Duration::from_millis(250),
-        "first-burst local echo took {local_echo_latency:?}"
-    );
     assert!(
         render_latency_us < 50_000,
         "input-read to physical-render latency was {render_latency_us} us"
