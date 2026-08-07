@@ -37,7 +37,6 @@ jobs:
       - name: Validate tag, manifest, and changelog
         id: metadata
         env:
-          GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ github.ref_name }}
           REQUESTED_REF: ${{ github.ref }}
         shell: bash
@@ -55,14 +54,6 @@ jobs:
 
           test "$(git cat-file -t "$tag")" = tag || {
             echo "release tag must be annotated" >&2
-            exit 1
-          }
-          tag_object_sha=$(git rev-parse "$tag^{tag}")
-          tag_verified=$(gh api \
-            "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" \
-            --jq '.verification.verified')
-          test "$tag_verified" = true || {
-            echo "release tag signature is not verified by GitHub" >&2
             exit 1
           }
           test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$tag")" || {

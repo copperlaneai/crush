@@ -15,19 +15,21 @@ release.
    tree.
 5. Confirm the repository is public. The stable one-line installer URL cannot
    be downloaded anonymously from a private repository.
-6. Create and push a signed annotated tag whose value exactly matches the Cargo
+6. Create and push an annotated tag whose value exactly matches the Cargo
    version:
 
    ```sh
-   git tag -s v0.1.0 -m 'crush 0.1.0'
+   git tag -a v0.1.0 -m 'crush 0.1.0'
    git push origin v0.1.0
    ```
 
 The workflow validates the tag/version match, builds six target archives,
 enforces the binary-size gate, creates SHA-256 checksums and an SPDX JSON SBOM,
 adds GitHub build provenance, creates Sigstore bundles, and publishes the GitHub
-release. The tag must already exist and be annotated; the workflow never creates
-or moves it. A manual re-run must be dispatched with that tag selected as the
+release. The tag must already exist and be annotated; artifact authenticity
+comes from the workflow's OIDC-backed Sigstore signatures and GitHub build
+provenance rather than a developer signing key. The workflow never creates or
+moves the tag. A manual re-run must be dispatched with that tag selected as the
 workflow ref so the Sigstore identity remains bound to `refs/tags/VERSION`.
 
 `scripts/prepare-release-assets.sh` validates the complete target set, copies
