@@ -7,11 +7,6 @@ SSH authentication and Mosh-style screen synchronization.
 crush user@example.com
 ```
 
-> [!WARNING]
-> Crush is pre-1.0 software. Its executable name also conflicts with
-> [Charmbracelet's Crush](https://github.com/charmbracelet/crush), so the
-> installer never replaces an existing `crush` unless `--force` is supplied.
-
 ## Install
 
 Crush supports macOS and Linux on x86-64 and ARM64:
