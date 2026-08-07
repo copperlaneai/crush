@@ -10,8 +10,9 @@ falls back to the SSH relay when its prerequisites are unavailable.
                          ┌─ noninteractive/uncertain ─> exec OpenSSH
 crush argv ─> classifier ┤
                          └─ interactive login shell
-                              ├─ mobile helper available ─> state sync
-                              └─ otherwise ───────────────> SSH PTY relay
+                              ├─ matching mobile helper ────────> state sync
+                              ├─ default helper missing/old ────> install ─> state sync
+                              └─ setup or UDP unavailable ──────> SSH PTY relay
 ```
 
 Forwarding, subsystems, remote commands without the mobile contract,
@@ -44,20 +45,27 @@ stream after bootstrap.
 
 1. The client starts OpenSSH with the original login-shell arguments and the
    configured helper command followed by `--server`.
-2. The helper binds the first available IPv4 UDP port in the configured range
+2. If the default helper is missing or reports a different version, the client
+   sends its bundled release installer through authenticated SSH. The installer
+   downloads and verifies the exact client release, installs it without root,
+   and the client retries bootstrap. Custom `CRUSH_SERVER` commands are never
+   modified automatically.
+3. The helper binds the first available IPv4 UDP port in the configured range
    (`60000:61000` by default) and generates a random 256-bit key.
-3. It returns `CRUSH/1 <port> <hex-key>` through the authenticated SSH channel.
-4. The client resolves the effective `Hostname` with `ssh -G`, sends terminal
+4. It returns `CRUSH/1 <port> <hex-key> <version>` through the authenticated SSH
+   channel.
+5. The client resolves the effective `Hostname` with `ssh -G`, sends terminal
    dimensions and Crush's stable `xterm-256color` emulator baseline in an
    authenticated UDP hello, and enters raw mode.
-5. The helper forks into a new session without placing the key in arguments or
+6. The helper forks into a new session without placing the key in arguments or
    environment, redirects the inherited standard descriptors to `/dev/null`,
    and lets the SSH bootstrap close.
-6. The detached helper allocates a PTY and launches the remote login shell while
+7. The detached helper allocates a PTY and launches the remote login shell while
    all terminal traffic uses UDP. A later TCP/SSH failure cannot end a healthy
    mobile session.
 
-`ProxyJump` and `ProxyCommand` currently make direct UDP ineligible. Auto mode
+`ProxyJump` and `ProxyCommand` can bootstrap the helper when the resolved host
+also has an independent direct UDP route from the client. Otherwise auto mode
 terminates the attempted helper and starts the ordinary SSH relay.
 
 ## Datagram protocol

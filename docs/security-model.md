@@ -44,6 +44,21 @@ The current protocol does not provide forward secrecy independent of the
 SSH-delivered session key, multi-party attachment, or recovery after key/process
 loss.
 
+## Automatic helper installation
+
+The release installer is bundled into the local Crush binary and sent to the
+remote shell only after SSH authentication succeeds. It requests the exact
+client version, verifies the downloaded release checksum, and also verifies the
+release workflow's Sigstore identity when Cosign is available.
+
+A missing default helper is installed without replacement permission. Crush
+supplies `--force` only after the existing command returns a structurally valid
+Crush bootstrap banner with a valid session key and a different version. A
+custom `CRUSH_SERVER` command is never installed, replaced, or upgraded
+automatically. These checks reduce executable-name collision risk; they do not
+remove trust in the remote account, GitHub release infrastructure, or the local
+Crush binary.
+
 ## Speculative input and secrets
 
 Local prediction can reveal a character on the physical screen before the
@@ -137,8 +152,10 @@ interpreted by the SSH remote shell; paths containing shell metacharacters must
 be treated as shell input and should be avoided.
 
 Another popular application also uses the executable name `crush`. The
-installer refuses every existing destination unless `--force` is explicit and
-never executes an existing file to identify it.
+standalone installer refuses every existing destination unless `--force` is
+explicit and never executes an existing file to identify it. Automatic remote
+upgrade supplies that flag only after a valid Crush helper banner identifies an
+older version at the default path.
 
 ## Diagnostics
 

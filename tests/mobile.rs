@@ -94,6 +94,188 @@ fn mobile_helper_round_trip_is_local_and_never_inserts_same_row_text() {
 }
 
 #[test]
+fn first_mobile_connection_installs_the_remote_helper() {
+    automatic_install_round_trip("mobile-auto-install", false);
+}
+
+#[test]
+fn first_mobile_connection_upgrades_a_known_older_helper() {
+    automatic_install_round_trip("mobile-auto-upgrade", true);
+}
+
+fn automatic_install_round_trip(test_name: &str, require_force: bool) {
+    let temp = TempDir::new(test_name);
+    let installed = temp.file("installed");
+    let installer_script = temp.file("installer.sh");
+    let fixture_shell = temp.executable(
+        "fixture-shell",
+        "#!/bin/sh\n\
+         /bin/stty echo\n\
+         printf '\\033[2J\\033[HCRUSH_MOBILE>'\n\
+         while IFS= read -r line; do\n\
+             if [ \"$line\" = quit ]; then exit 7; fi\n\
+         done\n",
+    );
+    let fake_ssh = temp.executable(
+        "auto-install-ssh",
+        "#!/bin/sh\n\
+         if [ \"${1-}\" = -G ]; then\n\
+             printf 'hostname 127.0.0.1\\n'\n\
+             exit 0\n\
+         fi\n\
+         if [ \"${2-}\" = sh ]; then\n\
+             [ \"${3-}\" = -s ] || exit 91\n\
+             [ \"${4-}\" = -- ] || exit 92\n\
+             [ \"${5-}\" = --version ] || exit 93\n\
+             [ \"${6-}\" = \"$TEST_VERSION\" ] || exit 94\n\
+             [ \"${7-}\" = --no-modify-path ] || exit 95\n\
+             if [ \"$TEST_REQUIRE_FORCE\" = 1 ]; then\n\
+                 [ \"${8-}\" = --force ] || exit 96\n\
+             else\n\
+                 [ -z \"${8-}\" ] || exit 97\n\
+             fi\n\
+             cat >\"$TEST_INSTALLER\"\n\
+             grep -q 'Install Crisp Remote Uninterrupted Shell' \"$TEST_INSTALLER\" || exit 98\n\
+             : >\"$TEST_INSTALLED\"\n\
+             exit 0\n\
+         fi\n\
+         if [ ! -e \"$TEST_INSTALLED\" ]; then\n\
+             if [ \"$TEST_REQUIRE_FORCE\" = 1 ]; then\n\
+                 printf 'CRUSH/1 60000 0000000000000000000000000000000000000000000000000000000000000000 0.0.0\\n'\n\
+             fi\n\
+             exit 127\n\
+         fi\n\
+         exec \"$TEST_CRUSH\" --server\n",
+    );
+
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", &fake_ssh)
+        .env("CRUSH_TRANSPORT", "mobile")
+        .env("TEST_CRUSH", crush_binary())
+        .env("TEST_INSTALLED", &installed)
+        .env("TEST_INSTALLER", &installer_script)
+        .env("TEST_REQUIRE_FORCE", if require_force { "1" } else { "0" })
+        .env("TEST_VERSION", env!("CARGO_PKG_VERSION"))
+        .env("SHELL", &fixture_shell)
+        .arg("fixture-host");
+
+    let mut run = PtyRun::spawn(command);
+    run.wait_for(PROMPT, Duration::from_secs(5));
+    assert!(installed.exists(), "remote helper was not installed");
+    assert!(
+        fs::read_to_string(&installer_script)
+            .expect("read transferred installer")
+            .starts_with("#!/bin/sh\n"),
+        "remote installer did not receive the bundled script"
+    );
+    run.write_input(b"quit\r");
+    let (status, _) = run.finish(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(7));
+}
+
+#[test]
+fn custom_remote_helper_path_is_never_automatically_replaced() {
+    let temp = TempDir::new("mobile-custom-helper");
+    let install_attempt = temp.file("install-attempt");
+    let fake_ssh = temp.executable(
+        "custom-helper-ssh",
+        "#!/bin/sh\n\
+         if [ \"${1-}\" = -G ]; then\n\
+             printf 'hostname 127.0.0.1\\n'\n\
+             exit 0\n\
+         fi\n\
+         if [ \"${2-}\" = sh ]; then\n\
+             : >\"$TEST_INSTALL_ATTEMPT\"\n\
+         fi\n\
+         exit 127\n",
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", &fake_ssh)
+        .env("CRUSH_TRANSPORT", "mobile")
+        .env("CRUSH_SERVER", "/custom/crush")
+        .env("TEST_INSTALL_ATTEMPT", &install_attempt)
+        .arg("fixture-host");
+
+    let run = PtyRun::spawn(command);
+    let (status, output) = run.finish(Duration::from_secs(5));
+    assert!(
+        !status.success(),
+        "missing custom helper unexpectedly succeeded"
+    );
+    assert!(!install_attempt.exists(), "custom helper path was replaced");
+    assert!(
+        output
+            .windows(31)
+            .any(|bytes| bytes == b"remote Crush helper unavailable"),
+        "missing-helper error was not reported: {output:?}"
+    );
+}
+
+#[test]
+fn ssh_failure_does_not_trigger_remote_installation() {
+    let temp = TempDir::new("mobile-ssh-failure");
+    let install_attempt = temp.file("install-attempt");
+    let fake_ssh = temp.executable(
+        "failed-bootstrap-ssh",
+        "#!/bin/sh\n\
+         if [ \"${2-}\" = sh ]; then\n\
+             : >\"$TEST_INSTALL_ATTEMPT\"\n\
+         fi\n\
+         exit 255\n",
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", &fake_ssh)
+        .env("CRUSH_TRANSPORT", "mobile")
+        .env("TEST_INSTALL_ATTEMPT", &install_attempt)
+        .arg("fixture-host");
+
+    let run = PtyRun::spawn(command);
+    let (status, _) = run.finish(Duration::from_secs(5));
+    assert!(
+        !status.success(),
+        "failed SSH bootstrap unexpectedly succeeded"
+    );
+    assert!(
+        !install_attempt.exists(),
+        "SSH failure triggered remote installation"
+    );
+}
+
+#[test]
+fn unrecognized_default_helper_is_never_automatically_replaced() {
+    let temp = TempDir::new("mobile-unrecognized-helper");
+    let install_attempt = temp.file("install-attempt");
+    let fake_ssh = temp.executable(
+        "unrecognized-helper-ssh",
+        "#!/bin/sh\n\
+         if [ \"${2-}\" = sh ]; then\n\
+             : >\"$TEST_INSTALL_ATTEMPT\"\n\
+         fi\n\
+         printf 'not a Crush bootstrap banner\\n'\n",
+    );
+    let mut command = crush_command();
+    command
+        .env("CRUSH_SSH", &fake_ssh)
+        .env("CRUSH_TRANSPORT", "mobile")
+        .env("TEST_INSTALL_ATTEMPT", &install_attempt)
+        .arg("fixture-host");
+
+    let run = PtyRun::spawn(command);
+    let (status, _) = run.finish(Duration::from_secs(5));
+    assert!(
+        !status.success(),
+        "unrecognized helper unexpectedly started a mobile session"
+    );
+    assert!(
+        !install_attempt.exists(),
+        "unrecognized helper was automatically replaced"
+    );
+}
+
+#[test]
 fn mobile_helper_preserves_overwrite_prediction_inside_real_tmux() {
     if std::env::var_os("CRUSH_RUN_MOBILE_TMUX_TESTS").as_deref() != Some("1".as_ref()) {
         eprintln!(

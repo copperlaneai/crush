@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-06
+
 ### Added
 
 - Rebuild interactive login shells around an SSH-bootstrapped, unprivileged
@@ -46,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absence of insert-character operations.
 - Establish the Rust project, byte-transparent OpenSSH relay contract,
   conservative prediction design, and release infrastructure.
+- Install the exact matching remote helper automatically on the first mobile
+  connection and synchronize older default helpers before bootstrap. Send the
+  bundled installer through authenticated SSH while leaving custom helper paths,
+  unknown executables, and failed SSH connections untouched.
 - Add opt-in `CRUSH_PREDICT=fast` first-keystroke faint local echo, input-read
   rendering, incremental cursor motion, in-place matching-echo reconciliation,
   a reversed-cell software cursor, atomic Kitty/tmux cursor settlement, submit
@@ -87,4 +93,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zeroized 64 KiB TUI frame buffers so continuous agent redraws do not allocate
   a fresh coalescing buffer for every physical paint.
 
-[Unreleased]: https://github.com/copperlaneai/crush/compare/d926629...HEAD
+[Unreleased]: https://github.com/copperlaneai/crush/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/copperlaneai/crush/releases/tag/v0.1.0

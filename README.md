@@ -20,13 +20,9 @@ Crush supports macOS and Linux on x86-64 and ARM64:
 curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | sh
 ```
 
-The mobile transport needs Crush on the remote host too:
-
-```sh
-curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | ssh user@example.com 'sh -s'
-```
-
-Open a new terminal if the installer adds `~/.local/bin` to `PATH`, then connect:
+Open a new terminal if the installer adds `~/.local/bin` to `PATH`, then
+connect. The first connection installs the matching helper on the remote host
+through SSH:
 
 ```sh
 crush user@example.com
@@ -60,7 +56,7 @@ crush -i ~/.ssh/work_ed25519 -p 2222 user@example.com
 ```
 
 Interactive login shells prefer the mobile transport. Commands, forwarding,
-subsystems, unsupported option forms, an unavailable helper, or unreachable UDP
+subsystems, unsupported option forms, failed helper setup, or unreachable UDP
 fall back to OpenSSH in the default `auto` mode. Existing SSH configuration,
 keys, host verification, `ProxyJump`, `ProxyCommand`, and SSM bootstrap continue
 to use the system `ssh` binary.

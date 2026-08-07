@@ -101,6 +101,7 @@ pub(crate) struct Config {
     pub(crate) prediction: Prediction,
     pub(crate) transport: Transport,
     pub(crate) server_program: OsString,
+    pub(crate) auto_install_server: bool,
     pub(crate) port_range: PortRange,
     /// Kept as a `PathBuf` so a non-UTF-8 trace path is not changed.
     pub(crate) trace: Option<PathBuf>,
@@ -160,9 +161,12 @@ impl Config {
             }
         };
 
-        let server_program = match get(CRUSH_SERVER) {
-            Some(value) => nonempty(CRUSH_SERVER, value, "a non-empty remote command")?,
-            None => OsString::from("$HOME/.local/bin/crush"),
+        let (server_program, auto_install_server) = match get(CRUSH_SERVER) {
+            Some(value) => (
+                nonempty(CRUSH_SERVER, value, "a non-empty remote command")?,
+                false,
+            ),
+            None => (OsString::from("$HOME/.local/bin/crush"), true),
         };
 
         let port_range = match get(CRUSH_PORT) {
@@ -199,6 +203,7 @@ impl Config {
             prediction,
             transport,
             server_program,
+            auto_install_server,
             port_range,
             trace,
             action,
@@ -299,6 +304,7 @@ mod tests {
                 prediction: Prediction::Auto,
                 transport: Transport::Auto,
                 server_program: OsString::from("$HOME/.local/bin/crush"),
+                auto_install_server: true,
                 port_range: PortRange::default(),
                 trace: None,
                 action: None,
@@ -325,6 +331,7 @@ mod tests {
         assert_eq!(parsed.prediction, Prediction::Off);
         assert_eq!(parsed.transport, Transport::Mobile);
         assert_eq!(parsed.server_program, OsStr::new("/opt/crush/bin/crush"));
+        assert!(!parsed.auto_install_server);
         assert_eq!(
             parsed.port_range,
             PortRange {

@@ -22,28 +22,39 @@ Confirm the installed version:
 crush --version
 ```
 
-## Install the remote helper
+## First connection
 
-The mobile transport needs the same Crush release on the client and remote
-host. Pipe the installer through the SSH connection you already use:
+Connect normally after installing Crush locally:
+
+```sh
+crush user@example.com
+```
+
+On the first mobile connection, Crush sends its bundled installer through the
+authenticated SSH session. The remote host downloads and verifies the exact
+release used by the client, then installs the helper at
+`~/.local/bin/crush` without root. Crush retries the connection automatically.
+
+This setup needs outbound access to GitHub Releases and the installer's standard
+POSIX command-line tools on the remote host. If automatic setup is unavailable,
+install the matching helper manually:
 
 ```sh
 curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | ssh user@example.com 'sh -s'
 ```
 
-The helper installs at `~/.local/bin/crush`, does not need root, and is launched
-only after SSH authentication succeeds. Crush uses that path by default.
-
 ## Upgrade
 
-Replacement is explicit because another project also ships a binary named
-`crush`. Upgrade an installation you recognize with:
+Replacement is explicit locally because another project also ships a binary
+named `crush`. Upgrade an installation you recognize with:
 
 ```sh
 curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | sh -s -- --force
 ```
 
-Upgrade the remote helper the same way:
+The next connection automatically upgrades the default remote helper to the
+local version. For a custom helper path or a host without release access,
+upgrade it manually:
 
 ```sh
 curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | ssh user@example.com 'sh -s -- --force'

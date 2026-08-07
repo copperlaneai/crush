@@ -7,8 +7,9 @@ the fastest transport compatible with the requested operation.
 
 | Operation | Auto behavior |
 | --- | --- |
-| Interactive login shell, helper installed, direct IPv4 UDP | Mobile state sync |
-| Interactive login shell without helper/UDP | OpenSSH PTY relay |
+| Interactive login shell, matching helper, direct IPv4 UDP | Mobile state sync |
+| Default helper missing or old, remote release access, direct IPv4 UDP | Install or upgrade helper, then mobile state sync |
+| Automatic helper setup or direct UDP unavailable | OpenSSH PTY relay |
 | SSH proxy bootstrap with independently reachable IPv4 UDP | Mobile state sync |
 | SSH proxy bootstrap without direct UDP | OpenSSH PTY relay |
 | Remote command with explicit `-t` | OpenSSH PTY relay |
@@ -33,13 +34,15 @@ and escape semantics on SSH paths.
 | macOS 11+ | x86-64, Apple Silicon | Supported target |
 | Windows/ConPTY | — | Deferred |
 
-The source-build MSRV is Rust 1.85. Client and helper should use the same Crush
-version until protocol negotiation supports mixed versions.
+The source-build MSRV is Rust 1.85. Crush checks the default helper version and
+installs or upgrades it to match the client before starting a mobile session.
+Custom helpers must be kept at the same version manually.
 
 ## Mobile prerequisites
 
-- The helper is installed at `~/.local/bin/crush`, or `CRUSH_SERVER` names its
-  path.
+- The remote host can run the bundled POSIX installer and reach GitHub Releases
+  on first setup or upgrade, or the matching helper is installed manually.
+- A custom `CRUSH_SERVER` path is installed and upgraded manually.
 - The SSH destination resolves to a directly reachable IPv4 address.
 - A return UDP flow to the helper's configured port/range is permitted
   (`60000:61000` by default).
@@ -135,7 +138,7 @@ secret workflows where a temporary visual guess is undesirable.
 - Mobile remote commands and subsystems.
 - Reattaching after the local Crush process exits.
 - Full local scrollback reconstruction.
-- Mixed client/helper protocol versions.
+- Version mismatch at a custom `CRUSH_SERVER` path.
 - Complete combining-character, hyperlink, clipboard-read, and graphics protocols.
 
 Each limitation falls back to OpenSSH in `auto` when the invocation can do so

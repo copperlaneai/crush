@@ -38,7 +38,11 @@ pub(crate) fn run_server(port_range: PortRange) -> io::Result<u8> {
     let port = socket.local_addr()?.port();
     let key = generate_key()?;
     let crypto = SessionCrypto::new(&key);
-    println!("{BANNER_PREFIX} {port} {}", encode_key(&key));
+    println!(
+        "{BANNER_PREFIX} {port} {} {}",
+        encode_key(&key),
+        env!("CARGO_PKG_VERSION")
+    );
     io::stdout().flush()?;
     if !detach_from_ssh()? {
         return Ok(0);

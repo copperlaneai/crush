@@ -851,7 +851,7 @@ fn run() -> Result<u8, Failure> {
                     Some(code) => return Ok(code),
                     None if config.transport == Transport::Mobile => {
                         return Err(Failure::config(
-                            "remote Crush helper unavailable; install `crush` on the server or set CRUSH_TRANSPORT=ssh",
+                            "remote Crush helper unavailable and automatic setup failed; install the matching helper manually or set CRUSH_TRANSPORT=ssh",
                         ));
                     }
                     None => {}

@@ -20,6 +20,7 @@ use crate::server::BANNER_PREFIX;
 use crate::trace::Trace;
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
+const BOOTSTRAP_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 const MOBILE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const HANDSHAKE_RETRY: Duration = Duration::from_millis(150);
 const INPUT_RETRY: Duration = Duration::from_millis(50);
@@ -30,15 +31,14 @@ const CONDITIONAL_MAX_HOLD: Duration = Duration::from_secs(2);
 const CURSOR_MOTION_MAX_HOLD: Duration = Duration::from_millis(150);
 const MAX_PENDING_INPUTS: usize = 256;
 const MAX_NETWORK_DATAGRAMS_PER_TURN: usize = 512;
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const INSTALLER: &[u8] = include_bytes!("../install.sh");
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn run_client(config: &Config, args: &[OsString]) -> io::Result<Option<u8>> {
     let terminal = PhysicalTerminal::capture()?;
     let winsize = terminal.winsize()?;
-    let Ok(mut bootstrap) = Bootstrap::start(config, args) else {
-        return Ok(None);
-    };
-    let Ok(banner) = bootstrap.read_banner(BOOTSTRAP_TIMEOUT) else {
+    let Some((mut bootstrap, banner)) = compatible_bootstrap(config, args) else {
         return Ok(None);
     };
     let Ok(address) = resolve_server(config, args, banner.port) else {
@@ -273,6 +273,7 @@ pub(crate) fn run_client(config: &Config, args: &[OsString]) -> io::Result<Optio
 struct BootstrapBanner {
     port: u16,
     key: String,
+    version: Option<String>,
 }
 
 struct Bootstrap {
@@ -307,10 +308,30 @@ impl Bootstrap {
         poll_one(self.stdout.get_ref().as_raw_fd(), libc::POLLIN, timeout)?;
         let mut line = String::new();
         if self.stdout.read_line(&mut line)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "remote Crush helper is not installed",
-            ));
+            let deadline = Instant::now() + BOOTSTRAP_EXIT_TIMEOUT;
+            loop {
+                match self.child.try_wait()? {
+                    Some(status) if status.code() == Some(127) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "remote Crush helper is not installed",
+                        ));
+                    }
+                    Some(status) => {
+                        return Err(io::Error::other(format!(
+                            "SSH bootstrap exited with {status}"
+                        )));
+                    }
+                    None if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    None => {
+                        return Err(io::Error::other(
+                            "SSH bootstrap closed its output without exiting",
+                        ));
+                    }
+                }
+            }
         }
         let mut words = line.split_whitespace();
         if words.next() != Some(BANNER_PREFIX) {
@@ -329,13 +350,16 @@ impl Bootstrap {
             .filter(|word| word.len() == 64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Crush session key"))?
             .to_owned();
+        decode_key(&key)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Crush session key"))?;
+        let version = words.next().map(str::to_owned);
         if words.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected fields in Crush bootstrap banner",
             ));
         }
-        Ok(BootstrapBanner { port, key })
+        Ok(BootstrapBanner { port, key, version })
     }
 
     fn finish(&mut self) {
@@ -350,6 +374,79 @@ impl Drop for Bootstrap {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+fn compatible_bootstrap(
+    config: &Config,
+    args: &[OsString],
+) -> Option<(Bootstrap, BootstrapBanner)> {
+    let force = match read_bootstrap(config, args) {
+        Ok((bootstrap, banner)) if banner.version.as_deref() == Some(CLIENT_VERSION) => {
+            return Some((bootstrap, banner));
+        }
+        Ok((mut bootstrap, _)) if config.auto_install_server => {
+            bootstrap.finish();
+            true
+        }
+        Err(error) if config.auto_install_server && error.kind() == io::ErrorKind::NotFound => {
+            false
+        }
+        Ok(_) | Err(_) => return None,
+    };
+
+    eprintln!("crush: installing remote helper {CLIENT_VERSION}");
+    if let Err(error) = install_remote_helper(config, args, force) {
+        eprintln!("crush: automatic remote helper installation failed: {error}");
+        return None;
+    }
+
+    match read_bootstrap(config, args) {
+        Ok((bootstrap, banner)) if banner.version.as_deref() == Some(CLIENT_VERSION) => {
+            Some((bootstrap, banner))
+        }
+        Ok(_) | Err(_) => {
+            eprintln!("crush: installed remote helper did not start with the expected version");
+            None
+        }
+    }
+}
+
+fn read_bootstrap(config: &Config, args: &[OsString]) -> io::Result<(Bootstrap, BootstrapBanner)> {
+    let mut bootstrap = Bootstrap::start(config, args)?;
+    let banner = bootstrap.read_banner(BOOTSTRAP_TIMEOUT)?;
+    Ok((bootstrap, banner))
+}
+
+fn install_remote_helper(config: &Config, args: &[OsString], force: bool) -> io::Result<()> {
+    let mut command = Command::new(&config.ssh_program);
+    command.args(args);
+    command.args([
+        "sh",
+        "-s",
+        "--",
+        "--version",
+        CLIENT_VERSION,
+        "--no-modify-path",
+    ]);
+    if force {
+        command.arg("--force");
+    }
+    command.stdin(Stdio::piped());
+    strip_crush_env(&mut command);
+    let mut child = command.spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("failed to open remote installer input"))?;
+    let write_result = stdin.write_all(INSTALLER);
+    drop(stdin);
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "remote installer exited with {status}"
+        )));
+    }
+    write_result
 }
 
 fn resolve_server(config: &Config, args: &[OsString], port: u16) -> io::Result<SocketAddr> {
