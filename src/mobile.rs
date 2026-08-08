@@ -806,6 +806,13 @@ struct ConditionalCell {
     predicted_at: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct RowBoundaryHandoff {
+    sequence: u64,
+    anchor: (usize, usize),
+    region: PredictionRegion,
+}
+
 #[derive(Default)]
 struct OverwritePredictor {
     cells: Vec<ConditionalCell>,
@@ -816,6 +823,7 @@ struct OverwritePredictor {
     cursor_predicted_at: Option<Instant>,
     handoff_sequence: Option<u64>,
     mismatch_since: Option<Instant>,
+    row_boundary_handoff: Option<RowBoundaryHandoff>,
     context: Option<ScreenContext>,
     origin: Option<(usize, usize)>,
     region: Option<PredictionRegion>,
@@ -848,6 +856,9 @@ impl OverwritePredictor {
             return;
         }
         if !frame.prediction_stable {
+            return;
+        }
+        if self.row_boundary_handoff.is_some() {
             return;
         }
         if self.suspended_at.is_some() {
@@ -940,7 +951,16 @@ impl OverwritePredictor {
             return;
         }
         if !frame.prediction_stable {
-            self.suspend(now);
+            if self.row_boundary_handoff.is_none() {
+                self.suspend(now);
+            }
+            return;
+        }
+        let remote_cursor = (
+            usize::from(frame.cursor_line),
+            usize::from(frame.cursor_column),
+        );
+        if self.row_boundary_pending(frame, remote_cursor) {
             return;
         }
         if self.suspended_at.is_some() {
@@ -955,21 +975,11 @@ impl OverwritePredictor {
             return;
         }
 
-        let columns = usize::from(frame.columns);
-        let lines = usize::from(frame.lines);
-        if self
-            .cells
-            .iter()
-            .any(|cell| cell.line >= lines || cell.column >= columns)
-        {
+        if !self.predictions_fit(frame) {
             self.clear();
             return;
         }
 
-        let remote_cursor = (
-            usize::from(frame.cursor_line),
-            usize::from(frame.cursor_column),
-        );
         if self
             .region
             .is_some_and(|region| PredictionRegion::around(frame, remote_cursor) != region)
@@ -1035,6 +1045,28 @@ impl OverwritePredictor {
         }
     }
 
+    fn row_boundary_pending(&mut self, frame: &WireFrame, remote_cursor: (usize, usize)) -> bool {
+        let Some(handoff) = self.row_boundary_handoff else {
+            return false;
+        };
+        let remote_reanchored = handoff.sequence <= frame.input_ack
+            && remote_cursor != handoff.anchor
+            && handoff.region.contains(remote_cursor);
+        if !remote_reanchored {
+            return true;
+        }
+        self.clear();
+        false
+    }
+
+    fn predictions_fit(&self, frame: &WireFrame) -> bool {
+        let columns = usize::from(frame.columns);
+        let lines = usize::from(frame.lines);
+        self.cells
+            .iter()
+            .all(|cell| cell.line < lines && cell.column < columns)
+    }
+
     fn overlay(&self, frame: &WireFrame) -> PredictionOverlay {
         if !frame.prediction_allowed {
             return PredictionOverlay {
@@ -1071,6 +1103,7 @@ impl OverwritePredictor {
         self.cursor_predicted_at = None;
         self.handoff_sequence = None;
         self.mismatch_since = None;
+        self.row_boundary_handoff = None;
         self.context = None;
         self.origin = None;
         self.region = None;
@@ -1154,6 +1187,20 @@ impl OverwritePredictor {
             self.clear();
             return;
         };
+        if next.0 != cursor.0 {
+            // A TUI can grow its input widget upward instead of accepting the
+            // terminal's linear continuation row. Wait for remote layout.
+            self.clear();
+            self.row_boundary_handoff = Some(RowBoundaryHandoff {
+                sequence,
+                anchor: (
+                    usize::from(frame.cursor_line),
+                    usize::from(frame.cursor_column),
+                ),
+                region,
+            });
+            return;
+        }
         if let Some(cell) = self
             .cells
             .iter_mut()
@@ -1470,34 +1517,49 @@ mod tests {
     }
 
     #[test]
-    fn prediction_wraps_inside_the_left_tmux_pane_without_touching_its_divider() {
-        let authoritative = split_pane_frame((1, 13), 0);
+    fn prediction_pauses_at_a_tmux_pane_row_boundary_until_remote_reanchors() {
+        let authoritative = split_pane_frame((1, 12), 0);
         let mut predictor = OverwritePredictor::default();
         predictor.apply(InputAction::Print(b'x'), 1, &authoritative);
         predictor.apply(InputAction::Print(b'y'), 2, &authoritative);
+        predictor.apply(InputAction::Print(b'z'), 3, &authoritative);
 
         let overlay = predictor.overlay(&authoritative);
-        assert_eq!(overlay.cursor, Some((2, 1)));
+        assert!(overlay.cells.is_empty());
+        assert_eq!(overlay.cursor, None);
+
+        let unchanged = split_pane_frame((1, 12), 3);
+        predictor.reconcile(&unchanged);
+        assert!(predictor.row_boundary_handoff.is_some());
+
+        let divider_cursor = split_pane_frame((1, 14), 3);
+        predictor.reconcile(&divider_cursor);
+        assert!(predictor.row_boundary_handoff.is_some());
+
+        let reanchored = split_pane_frame((2, 1), 3);
+        predictor.reconcile(&reanchored);
+        predictor.apply(InputAction::Print(b'q'), 4, &reanchored);
+        let overlay = predictor.overlay(&reanchored);
+        assert_eq!(overlay.cursor, Some((2, 2)));
         assert_eq!(
             overlay
                 .cells
                 .iter()
                 .map(|cell| (cell.line, cell.column, cell.byte))
                 .collect::<Vec<_>>(),
-            vec![(1, 13, b'x'), (2, 0, b'y')]
+            vec![(2, 1, b'q')]
         );
-        assert!(overlay.cells.iter().all(|cell| cell.column != 14));
     }
 
     #[test]
-    fn prediction_wraps_and_submits_inside_the_right_tmux_pane() {
-        let authoritative = split_pane_frame((1, 29), 0);
+    fn prediction_submit_stays_inside_the_right_tmux_pane() {
+        let authoritative = split_pane_frame((1, 28), 0);
         let mut predictor = OverwritePredictor::default();
         predictor.apply(InputAction::Print(b'x'), 1, &authoritative);
-        assert_eq!(predictor.overlay(&authoritative).cursor, Some((2, 15)));
+        assert_eq!(predictor.overlay(&authoritative).cursor, Some((1, 29)));
 
         predictor.apply(InputAction::Submit, 2, &authoritative);
-        assert_eq!(predictor.overlay(&authoritative).cursor, Some((3, 15)));
+        assert_eq!(predictor.overlay(&authoritative).cursor, Some((2, 15)));
         assert!(
             predictor
                 .overlay(&authoritative)

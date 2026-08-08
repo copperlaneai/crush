@@ -39,8 +39,8 @@ Prediction tests require these invariants:
 - every predicted cell uses an absolute coordinate;
 - no frame contains ICH (`CSI @`) or relative-backspace cursor cleanup;
 - occupied cells to the right retain their original coordinates;
-- side-by-side tmux prediction wraps to the active pane's left edge and never
-  addresses its divider or status row;
+- side-by-side tmux prediction stops at a physical row boundary, never addresses
+  its divider or status row, and resumes from the remote continuation anchor;
 - a pane-border change invalidates the old full-width prediction anchor;
 - unrelated status frames do not roll pending typing backward;
 - an echo-eligible frame whose authoritative cursor is still behind the local
@@ -76,8 +76,9 @@ cargo test --test mobile --locked -- --nocapture
 
 It attaches a real tmux client, types beside occupied same-row text, verifies
 instant overwrite prediction, types at the final column of a side-by-side pane,
-requires the predicted cursor to wrap within that pane without addressing the
-divider, submits through the pane, detaches, and checks clean status propagation.
+requires prediction to pause until tmux publishes the wrapped row without
+addressing the divider, submits through the pane, detaches, and checks clean
+status propagation.
 
 Exercise authenticated ping/pong across the client's full 30-second silence
 timeout with:

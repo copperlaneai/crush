@@ -346,21 +346,10 @@ fn mobile_helper_preserves_overwrite_prediction_inside_real_tmux() {
     run.wait_for(b"CRUSH_TMUX>", Duration::from_secs(10));
     run.wait_for(b"SIDE_PANE", Duration::from_secs(5));
     assert_tmux_clipboard_sync(tmux.as_os_str(), &socket, &run);
-    let before_prediction = run.snapshot().len();
-    run.write_input(b"z");
-    run.wait_for(b"\x1b[0;2", Duration::from_secs(2));
-    let predicted = run.snapshot();
-    let predicted = &predicted[before_prediction..];
-    assert!(
-        predicted.windows(6).any(|bytes| bytes == b"\x1b[2;1H"),
-        "last-column input did not wrap to the left edge of its tmux pane: {predicted:?}"
-    );
-    assert!(
-        !predicted.windows(7).any(|bytes| bytes == b"\x1b[1;40H"),
-        "prediction addressed the tmux divider column: {predicted:?}"
-    );
+    thread::sleep(Duration::from_millis(120));
+    assert_tmux_row_boundary_handoff(&mut run);
     run.write_input(b"\r");
-    run.wait_for(b"TMUX_GOT:z", Duration::from_secs(5));
+    run.wait_for(b"TMUX_GOT:zy", Duration::from_secs(5));
     assert!(
         !run.snapshot().windows(3).any(|bytes| bytes == b"\x1b[@"),
         "mobile prediction issued insert-character inside tmux"
@@ -374,6 +363,29 @@ fn mobile_helper_preserves_overwrite_prediction_inside_real_tmux() {
     assert!(
         status.success(),
         "tmux-backed mobile session failed: {status}"
+    );
+}
+
+fn assert_tmux_row_boundary_handoff(run: &mut PtyRun) {
+    let before_boundary = run.snapshot().len();
+    run.write_input(b"z");
+    run.wait_for(b"\x1b[1;40H", Duration::from_secs(2));
+    let at_boundary = run.snapshot();
+    let at_boundary = &at_boundary[before_boundary..];
+    assert!(
+        !at_boundary.windows(6).any(|bytes| bytes == b"\x1b[2;1H"),
+        "prediction crossed an unconfirmed tmux row boundary: {at_boundary:?}"
+    );
+    run.write_input(b"y");
+    run.wait_for(b"\x1b[2;1H\x1b[0;39;49my", Duration::from_secs(2));
+    let wrapped = run.snapshot();
+    let wrapped = &wrapped[before_boundary..];
+    let dim_divider_write = b"\x1b[1;40H\x1b[0;2";
+    assert!(
+        !wrapped
+            .windows(dim_divider_write.len())
+            .any(|bytes| bytes == dim_divider_write),
+        "prediction addressed the tmux divider column: {wrapped:?}"
     );
 }
 

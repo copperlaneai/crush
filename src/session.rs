@@ -1047,6 +1047,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
     };
     let mut echo_anchor = None;
     let mut rearm_after_output = true;
+    let mut row_boundary_anchor = None;
     let mut controller_closed = false;
     let mut child_status = None;
     let mut remote_buffer = Zeroizing::new(vec![0_u8; REMOTE_READ_SIZE].into_boxed_slice());
@@ -1144,6 +1145,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                         shadow_backlog.zeroize();
                         shadow_lagged = false;
                         echo_anchor = None;
+                        row_boundary_anchor = None;
                         let size = pty.resize_from(&terminal)?;
                         terminal_size = TerminalSize::new(size.ws_col, size.ws_row);
                         if let Some(shadow) = &mut shadow {
@@ -1199,6 +1201,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                         )?;
                         shadow_backlog.zeroize();
                         shadow_lagged = false;
+                        row_boundary_anchor = None;
                         finish_resume(&pty, &mut session_input);
                         lifecycle_transition = true;
                     }
@@ -1264,6 +1267,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                 shadow = Some(ShadowTerminal::new(terminal_size));
                 desired_overlay.zeroize();
                 echo_anchor = None;
+                row_boundary_anchor = None;
                 display.clear()?;
                 if let Some(trace) = &mut trace {
                     trace.event("prediction_overflow", &[]);
@@ -1289,6 +1293,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                     &mut echo_anchor,
                     &mut desired_overlay,
                     &mut rearm_after_output,
+                    &mut row_boundary_anchor,
                     &mut display,
                     trace.as_ref(),
                 )?;
@@ -1308,6 +1313,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                 &mut echo_anchor,
                 &mut desired_overlay,
                 &mut rearm_after_output,
+                &mut row_boundary_anchor,
                 &mut display,
                 &mut trace,
             )?;
@@ -1342,6 +1348,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                             &mut echo_anchor,
                             &mut desired_overlay,
                             &mut rearm_after_output,
+                            &mut row_boundary_anchor,
                             &mut display,
                             &mut shadow_backlog,
                             &mut shadow_lagged,
@@ -1372,6 +1379,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                     &mut echo_anchor,
                     &mut desired_overlay,
                     &mut rearm_after_output,
+                    &mut row_boundary_anchor,
                     &mut display,
                     &mut shadow_backlog,
                     &mut shadow_lagged,
@@ -1390,6 +1398,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                 if shadow_lagged {
                     shadow = Some(ShadowTerminal::new(terminal_size));
                     shadow_lagged = false;
+                    row_boundary_anchor = None;
                 } else if !shadow_backlog.is_empty() {
                     let shadow = shadow
                         .as_mut()
@@ -1403,6 +1412,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                         &mut echo_anchor,
                         &mut desired_overlay,
                         &mut rearm_after_output,
+                        &mut row_boundary_anchor,
                         &mut display,
                         trace.as_ref(),
                     )?;
@@ -1438,6 +1448,7 @@ fn run_interactive(config: &Config, args: &[OsString]) -> io::Result<u8> {
                         )?;
                         shadow_backlog.zeroize();
                         shadow_lagged = false;
+                        row_boundary_anchor = None;
                         finish_resume(&pty, &mut session_input);
                     }
                     ChildState::Exited(status) => child_status = Some(status),
@@ -1523,6 +1534,7 @@ fn process_remote_output(
     echo_anchor: &mut Option<CursorSnapshot>,
     desired_overlay: &mut Vec<u8>,
     rearm_after_output: &mut bool,
+    row_boundary_anchor: &mut Option<CursorSnapshot>,
     display: &mut SessionDisplay,
     shadow_backlog: &mut Vec<u8>,
     shadow_lagged: &mut bool,
@@ -1555,6 +1567,7 @@ fn process_remote_output(
             echo_anchor,
             desired_overlay,
             rearm_after_output,
+            row_boundary_anchor,
             trace.as_ref(),
         );
         let previous_software = previous_software
@@ -1680,6 +1693,7 @@ fn update_prediction_after_output(
     echo_anchor: &mut Option<CursorSnapshot>,
     desired_overlay: &mut Vec<u8>,
     rearm_after_output: &mut bool,
+    row_boundary_anchor: &mut Option<CursorSnapshot>,
     display: &mut SessionDisplay,
     trace: Option<&Trace>,
 ) -> io::Result<()> {
@@ -1691,6 +1705,7 @@ fn update_prediction_after_output(
         echo_anchor,
         desired_overlay,
         rearm_after_output,
+        row_boundary_anchor,
         trace,
     );
     if shadow_can_overlay(shadow, fast_prediction, desired_overlay.len()) {
@@ -1710,6 +1725,7 @@ fn reconcile_prediction_after_output(
     echo_anchor: &mut Option<CursorSnapshot>,
     desired_overlay: &mut Vec<u8>,
     rearm_after_output: &mut bool,
+    row_boundary_anchor: &mut Option<CursorSnapshot>,
     trace: Option<&Trace>,
 ) {
     let trust_before = predictor.terminal_trust();
@@ -1732,6 +1748,12 @@ fn reconcile_prediction_after_output(
     );
     if fast_prediction {
         *rearm_after_output = shadow.can_overlay_fast(1);
+    }
+    if row_boundary_anchor.is_some_and(|anchor| shadow.cursor() != anchor) {
+        *row_boundary_anchor = None;
+    }
+    if row_boundary_anchor.is_some() {
+        *rearm_after_output = false;
     }
     sync_prediction_trust(
         shadow,
@@ -1798,6 +1820,7 @@ fn drain_input_events(
     echo_anchor: &mut Option<CursorSnapshot>,
     desired_overlay: &mut Vec<u8>,
     rearm_after_output: &mut bool,
+    row_boundary_anchor: &mut Option<CursorSnapshot>,
     display: &mut SessionDisplay,
     trace: &mut Option<Trace>,
 ) -> io::Result<bool> {
@@ -1834,6 +1857,7 @@ fn drain_input_events(
                         echo_anchor,
                         desired_overlay,
                         rearm_after_output,
+                        row_boundary_anchor,
                         display,
                         trace,
                     )?;
@@ -1877,6 +1901,7 @@ fn apply_observed_input(
     echo_anchor: &mut Option<CursorSnapshot>,
     desired_overlay: &mut Vec<u8>,
     rearm_after_output: &mut bool,
+    row_boundary_anchor: &mut Option<CursorSnapshot>,
     display: &mut SessionDisplay,
     trace: &mut Option<Trace>,
 ) -> io::Result<()> {
@@ -1918,6 +1943,14 @@ fn apply_observed_input(
                     }
                     rendered_bytes = rendered_bytes.saturating_add(1);
                 } else {
+                    if fast_prediction && fast_prediction_crosses_row(shadow, desired_overlay.len())
+                    {
+                        *row_boundary_anchor = Some(shadow.cursor());
+                        *rearm_after_output = false;
+                        if let Some(trace) = trace {
+                            trace.event("prediction_row_boundary", &[]);
+                        }
+                    }
                     let _ = predictor.authoritative_change();
                     desired_overlay.zeroize();
                     *echo_anchor = None;
@@ -2077,10 +2110,22 @@ fn shadow_can_overlay(shadow: &ShadowTerminal, fast_prediction: bool, width: usi
     if fast_prediction {
         width != 0
             && !shadow.likely_hidden_input()
+            && !fast_prediction_crosses_row(shadow, width)
             && shadow.can_overlay_fast(width.saturating_add(1))
     } else {
         shadow.can_overlay(width)
     }
+}
+
+fn fast_prediction_crosses_row(shadow: &ShadowTerminal, width: usize) -> bool {
+    if width == 0 {
+        return false;
+    }
+    // A physical continuation row is not authoritative for a reflowing TUI.
+    let anchor = shadow.cursor();
+    shadow
+        .cursor_after_cells(anchor, width)
+        .is_some_and(|software_cursor| software_cursor.line != anchor.line)
 }
 
 fn render_prediction(

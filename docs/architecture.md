@@ -133,7 +133,7 @@ Crush has no insert-style prediction. Every eligible character:
 
 1. is assigned an absolute `(row, column)` from the last authoritative cursor;
 2. overwrites only that physical cell in faint style;
-3. advances the displayed cursor to the next absolute cell; and
+3. advances the displayed cursor only while it remains on the authoritative row; and
 4. remains a conditional replacement outside the authoritative framebuffer.
 
 The renderer never emits ICH (`CSI @`) or relative-backspace cleanup. It applies
@@ -143,9 +143,11 @@ change from faint to normal, with the cursor staying at the composed location.
 
 When the cursor is inside side-by-side tmux panes, Crush identifies continuous
 vertical border segments in the authoritative framebuffer. Their columns and
-vertical extent define the editable pane rectangle: wrapping returns to that
-pane's left edge, never the terminal's left edge, and prediction stops before a
-divider or status row. A changed border layout starts a new prediction epoch.
+vertical extent define the editable pane rectangle, so prediction stops before
+a divider or status row. Prediction pauses at every physical row boundary until
+the remote screen publishes its new cursor anchor. This avoids composing stale
+absolute cells over coding-agent input widgets that grow or reflow upward. A
+changed border layout starts a new prediction epoch.
 
 Remote output does not invalidate pending printable text merely because an
 unrelated status frame moved the authoritative cursor. Transport receipt is

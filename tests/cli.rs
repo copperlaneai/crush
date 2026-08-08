@@ -732,14 +732,14 @@ printf 'x'
 }
 
 #[test]
-fn fast_prediction_and_software_cursor_wrap_across_rows() {
+fn fast_prediction_pauses_at_a_row_boundary_until_remote_reanchors() {
     const READY: &[u8] = b"\x1b[?2026l";
     const INPUT: &[u8] = b"wrap";
-    const SETTLED: &[u8] =
-        b"\x1b[10;79Hwrap\x1b[11;3H\x1b[2ma\x1b[22m\x1b[11;3H\x1b[?25h\x1b[?2026l";
+    const SETTLED: &[u8] = b"\x1b[?2026h\x1b[10;79Hwrap\x1b[?2026l";
 
     let temp = TempDir::new("wrapped-coding-agent-input");
     let input_file = temp.file("input.bin");
+    let release_file = temp.file("release");
     let trace_file = temp.file("trace.jsonl");
     let fake_ssh = temp.executable(
         "wrapped-coding-agent-ssh",
@@ -747,7 +747,7 @@ fn fast_prediction_and_software_cursor_wrap_across_rows() {
 stty raw -echo
 printf '\033[?2026h\033[2J\033[H\033[10;77H\033[1m\342\200\272\033[22m\033[10;79H\033[2mEx\033[22m\033[11;1H\033[2mplain this codebase\033[22m\033[?25h\033[10;79H\033[?2026l'
 dd of="$TEST_INPUT_FILE" bs=1 count=4 2>/dev/null
-sleep 0.1
+while [ ! -e "$TEST_RELEASE_FILE" ]; do sleep 0.01; done
 printf '\033[?2026h\033[10;79Hwrap\033[?2026l'
 "#,
     );
@@ -757,25 +757,20 @@ printf '\033[?2026h\033[10;79Hwrap\033[?2026l'
         .env("CRUSH_MODE", "force")
         .env("CRUSH_PREDICT", "fast")
         .env("TEST_INPUT_FILE", &input_file)
+        .env("TEST_RELEASE_FILE", &release_file)
         .env("CRUSH_TRACE", &trace_file)
         .arg("user@example.test");
 
     let mut run = PtyRun::spawn(command, Some(READY));
     run.wait_until_ready();
     wait_for_file_contents(&trace_file, b"\"event\":\"prediction_ready\"");
-    for (index, &byte) in INPUT.iter().enumerate() {
-        run.write_input(&[byte]);
-        let linear_column = 78 + index + 1;
-        let row = 10 + linear_column / 80;
-        let column = linear_column % 80 + 1;
-        let cursor_underlay = b"Explain this codebase"[index + 1];
-        let software_cursor = format!(
-            "\x1b[{row};{column}H\x1b[2;7m{}\x1b[22;27m\x1b[{row};{column}H",
-            char::from(cursor_underlay)
-        );
-        wait_for_output(&run, software_cursor.as_bytes());
-    }
+    run.write_input(&INPUT[..1]);
+    wait_for_output(&run, b"\x1b[10;80H\x1b[2;7mx\x1b[22;27m\x1b[10;80H");
+    run.write_input(&INPUT[1..]);
+    wait_for_file_contents(&input_file, INPUT);
+    wait_for_file_contents(&trace_file, b"\"event\":\"prediction_row_boundary\"");
     let before_acknowledgement = run.output_snapshot();
+    fs::write(&release_file, b"release").expect("release wrapped fixture repaint");
     wait_for_output(&run, SETTLED);
     let (status, output) = run.finish();
 
@@ -784,8 +779,8 @@ printf '\033[?2026h\033[10;79Hwrap\033[?2026l'
     let first_local = find_subslice(&before_acknowledgement, b"\x1b[?25l")
         .expect("wrapped input has an immediate first local frame");
     assert!(
-        find_subslice(&before_acknowledgement[first_local..], b"\x1b[?25h").is_none(),
-        "the native cursor must stay hidden while local input crosses rows"
+        find_subslice(&before_acknowledgement[first_local..], b"\x1b[11;").is_none(),
+        "speculative input crossed into an unconfirmed row"
     );
     assert!(
         find_subslice(&output, SETTLED).is_some(),
@@ -794,13 +789,10 @@ printf '\033[?2026h\033[10;79Hwrap\033[?2026l'
     let trace = fs::read_to_string(trace_file).expect("read wrapped trace");
     assert_eq!(
         trace.matches("\"event\":\"prediction_rendered\"").count(),
-        INPUT.len(),
-        "every wrapped key must render immediately: {trace}"
+        1,
+        "only the same-row prefix should render speculatively: {trace}"
     );
-    assert!(
-        !trace.contains("\"event\":\"prediction_blocked\""),
-        "{trace}"
-    );
+    assert!(trace.contains("\"event\":\"prediction_row_boundary\""));
 }
 
 #[test]

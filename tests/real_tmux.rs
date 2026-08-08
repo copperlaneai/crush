@@ -168,6 +168,7 @@ fn local_tmux_fast_prediction_is_visibly_faint() {
         .env("CRUSH_SSH", launcher)
         .env("CRUSH_MODE", "force")
         .env("CRUSH_PREDICT", "fast")
+        .env("CRUSH_TRANSPORT", "ssh")
         .env_remove("CRUSH_ACTION")
         .env("CRUSH_TRACE", &trace)
         .env("TEST_TMUX_BIN", &tmux)
@@ -219,7 +220,6 @@ fn local_tmux_coding_agent_keeps_every_key_composed() {
     const INPUT: &[u8] = b"crushsync";
     const PLACEHOLDER: &[u8] = b"Explain this codebase";
     const WRAPPED_INPUT: &[u8] = b"wrap";
-    const WRAPPED_PLACEHOLDER: &[u8] = b"Explain this codebase";
     if env::var_os("CRUSH_RUN_LOCAL_TMUX_TESTS").as_deref() != Some("1".as_ref()) {
         eprintln!("skipping local tmux coding-agent test; set CRUSH_RUN_LOCAL_TMUX_TESTS=1");
         return;
@@ -247,6 +247,7 @@ fn local_tmux_coding_agent_keeps_every_key_composed() {
         .env("CRUSH_SSH", launcher)
         .env("CRUSH_MODE", "force")
         .env("CRUSH_PREDICT", "fast")
+        .env("CRUSH_TRANSPORT", "ssh")
         .env("CRUSH_TRACE", &trace)
         .env("TEST_TMUX_BIN", &tmux)
         .env("TEST_SOCKET", &socket_name)
@@ -268,7 +269,7 @@ fn local_tmux_coding_agent_keeps_every_key_composed() {
     exercise_agent_keys(&mut run, &trace, INPUT, PLACEHOLDER);
     run.wait_for(b"CRUSH_AGENT_WRAP_READY", START_TIMEOUT)
         .unwrap_or_else(|error| panic!("wrapped coding-agent prompt did not appear: {error}"));
-    exercise_wrapped_agent_keys(&mut run, &trace, WRAPPED_INPUT, WRAPPED_PLACEHOLDER);
+    exercise_wrapped_agent_keys(&mut run, &trace, WRAPPED_INPUT);
 
     let (status, output) = run
         .finish(EXIT_TIMEOUT)
@@ -288,13 +289,12 @@ fn local_tmux_coding_agent_keeps_every_key_composed() {
     let trace = fs::read_to_string(trace).expect("read coding-agent tmux trace");
     assert_eq!(
         trace.matches("\"event\":\"prediction_rendered\"").count(),
-        INPUT.len() + WRAPPED_INPUT.len(),
-        "every key must receive one immediate local render: {trace}"
+        INPUT.len() + 1,
+        "wrapped input must pause after its same-row prefix: {trace}"
     );
     assert!(
-        trace.matches("\"event\":\"tui_frame_composed\"").count()
-            >= INPUT.len() + WRAPPED_INPUT.len(),
-        "every tmux repaint must retain the software cursor: {trace}"
+        trace.matches("\"event\":\"tui_frame_composed\"").count() >= INPUT.len(),
+        "same-row tmux repaints must retain the software cursor: {trace}"
     );
     assert!(
         !trace.contains("\"event\":\"prediction_blocked\""),
@@ -358,48 +358,24 @@ fn exercise_agent_keys(run: &mut PtyProcess, trace: &Path, input: &[u8], placeho
     }
 }
 
-fn exercise_wrapped_agent_keys(
-    run: &mut PtyProcess,
-    trace: &Path,
-    input: &[u8],
-    placeholder: &[u8],
-) {
+fn exercise_wrapped_agent_keys(run: &mut PtyProcess, trace: &Path, input: &[u8]) {
     let rendered_before = trace_event_count(trace, b"\"event\":\"prediction_rendered\"");
-    let composed_before = trace_event_count(trace, b"\"event\":\"tui_frame_composed\"");
-    for (index, &byte) in input.iter().enumerate() {
-        run.write_input(&[byte])
-            .expect("type wrapped coding-agent key through tmux");
-        wait_for_file_event_count(
-            trace,
-            b"\"event\":\"prediction_rendered\"",
-            rendered_before + index + 1,
-        );
-        let software_cursor = expected_wrapped_software_cursor(index + 1, placeholder[index + 1]);
-        run.wait_for(&software_cursor, Duration::from_secs(2))
-            .unwrap_or_else(|error| {
-                panic!("wrapped key {index} lacked its absolute software cursor: {error}")
-            });
-        wait_for_file_event_count(
-            trace,
-            b"\"event\":\"tui_frame_composed\"",
-            composed_before + index + 1,
-        );
-    }
-}
-
-fn expected_wrapped_software_cursor(input_len: usize, cursor_underlay: u8) -> Vec<u8> {
-    const COLUMNS: usize = 80;
-    const ANCHOR_ROW: usize = 10;
-    const ANCHOR_COLUMN: usize = 79;
-
-    let linear_column = ANCHOR_COLUMN - 1 + input_len;
-    let row = ANCHOR_ROW + linear_column / COLUMNS;
-    let column = linear_column % COLUMNS + 1;
-    format!(
-        "\x1b[{row};{column}H\x1b[2;7m{}\x1b[22;27m\x1b[{row};{column}H",
-        char::from(cursor_underlay)
+    run.write_input(&input[..1])
+        .expect("type same-row coding-agent key through tmux");
+    wait_for_file_event_count(
+        trace,
+        b"\"event\":\"prediction_rendered\"",
+        rendered_before + 1,
+    );
+    run.wait_for(
+        b"\x1b[10;80H\x1b[2;7mx\x1b[22;27m\x1b[10;80H",
+        Duration::from_secs(2),
     )
-    .into_bytes()
+    .unwrap_or_else(|error| panic!("same-row key lacked its software cursor: {error}"));
+
+    run.write_input(&input[1..])
+        .expect("type row-crossing coding-agent keys through tmux");
+    wait_for_file_contents(trace, b"\"event\":\"prediction_row_boundary\"");
 }
 
 fn expected_local_cursor_append(byte: u8, cursor_underlay: u8, index: usize) -> Vec<u8> {

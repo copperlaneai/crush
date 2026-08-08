@@ -103,9 +103,11 @@ terminal, but the changed-cell output remains correct; the outer tmux controls
 when it presents the completed local paint.
 
 Side-by-side remote panes are detected from tmux's visible vertical border run.
-Predicted wrapping and Enter stay within the active pane and do not address the
-divider or the status row below it. Moving or replacing the split invalidates
-the old pane anchor before another speculative paint.
+Prediction and Enter stay within the active pane and do not address the divider
+or the status row below it. At a physical row boundary, prediction waits for
+tmux or the application to publish the continuation row before it resumes.
+Moving or replacing the split invalidates the old pane anchor before another
+speculative paint.
 
 ## Coding agents
 

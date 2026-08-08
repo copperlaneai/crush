@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pause speculative input at physical row boundaries until the remote screen
+  publishes its continuation anchor, preventing transient duplicated input rows
+  when coding-agent widgets reflow inside tmux.
+
 ## [0.1.0] - 2026-08-06
 
 ### Added
