@@ -802,8 +802,22 @@ struct ConditionalCell {
     line: usize,
     column: usize,
     byte: u8,
+    edit: CellEdit,
     sequence: u64,
     predicted_at: Instant,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CellEdit {
+    Write,
+    Erase,
+}
+
+#[derive(Clone, Copy)]
+struct EditableCell {
+    line: usize,
+    column: usize,
+    byte: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -816,6 +830,7 @@ struct RowBoundaryHandoff {
 #[derive(Default)]
 struct OverwritePredictor {
     cells: Vec<ConditionalCell>,
+    editable_cells: Vec<EditableCell>,
     cursor: Option<(usize, usize)>,
     suspended_cursor: Option<(usize, usize)>,
     suspended_at: Option<Instant>,
@@ -871,30 +886,7 @@ impl OverwritePredictor {
         };
         match action {
             InputAction::Print(byte) => self.apply_print(byte, sequence, frame, region),
-            InputAction::Backspace => {
-                let now = Instant::now();
-                let cursor = self.cursor.unwrap_or((
-                    usize::from(frame.cursor_line),
-                    usize::from(frame.cursor_column),
-                ));
-                let Some(target) = retreat_cell(cursor, region) else {
-                    return;
-                };
-                let Some(cell) = self
-                    .cells
-                    .iter_mut()
-                    .find(|cell| (cell.line, cell.column) == target)
-                else {
-                    // Without a pending local cell, the target belongs to the
-                    // authoritative screen and may be part of the prompt. Let
-                    // the remote line editor decide whether it is erasable.
-                    return;
-                };
-                cell.byte = b' ';
-                cell.sequence = sequence;
-                cell.predicted_at = now;
-                self.set_conditional_cursor(target, sequence, now);
-            }
+            InputAction::Backspace => self.apply_backspace(sequence, frame, region),
             InputAction::MoveLeft => {
                 let now = Instant::now();
                 let cursor = self.cursor.unwrap_or((
@@ -987,6 +979,7 @@ impl OverwritePredictor {
             self.clear();
             return;
         }
+        self.retain_authoritative_edit_history(frame);
         if self
             .oldest_sequence()
             .is_some_and(|sequence| sequence <= frame.input_ack)
@@ -996,23 +989,7 @@ impl OverwritePredictor {
             return;
         }
         let cursor_matches = self.cursor == Some(remote_cursor);
-        let mut eligible_mismatch = false;
-        let mut expired = false;
-        self.cells.retain(|predicted| {
-            if predicted.sequence > frame.echo_ack {
-                return true;
-            }
-            let actual = frame
-                .character(predicted.line, predicted.column)
-                .unwrap_or(' ');
-            if actual == char::from(predicted.byte) {
-                return false;
-            }
-            eligible_mismatch = true;
-            expired |=
-                now.saturating_duration_since(predicted.predicted_at) >= CONDITIONAL_MAX_HOLD;
-            true
-        });
+        let (eligible_mismatch, expired) = self.reconcile_predicted_cells(frame, now);
         let cursor_expired = self.cursor_predicted_at.is_some_and(|predicted_at| {
             now.saturating_duration_since(predicted_at) >= CONDITIONAL_MAX_HOLD
         });
@@ -1040,9 +1017,41 @@ impl OverwritePredictor {
             self.cursor_sequence = None;
             self.cursor_predicted_at = None;
         }
-        if self.cells.is_empty() && self.cursor.is_none() {
+        if self.cells.is_empty() && self.cursor.is_none() && self.editable_cells.is_empty() {
             self.context = None;
         }
+    }
+
+    fn retain_authoritative_edit_history(&mut self, frame: &WireFrame) {
+        self.editable_cells.retain(|editable| {
+            frame.character(editable.line, editable.column) == Some(char::from(editable.byte))
+        });
+    }
+
+    fn reconcile_predicted_cells(&mut self, frame: &WireFrame, now: Instant) -> (bool, bool) {
+        let mut eligible_mismatch = false;
+        let mut expired = false;
+        let mut confirmed_edits = Vec::new();
+        self.cells.retain(|predicted| {
+            if predicted.sequence > frame.echo_ack {
+                return true;
+            }
+            let actual = frame
+                .character(predicted.line, predicted.column)
+                .unwrap_or(' ');
+            if actual == char::from(predicted.byte) {
+                confirmed_edits.push(*predicted);
+                return false;
+            }
+            eligible_mismatch = true;
+            expired |=
+                now.saturating_duration_since(predicted.predicted_at) >= CONDITIONAL_MAX_HOLD;
+            true
+        });
+        for confirmed in confirmed_edits {
+            self.confirm_edit(confirmed);
+        }
+        (eligible_mismatch, expired)
     }
 
     fn row_boundary_pending(&mut self, frame: &WireFrame, remote_cursor: (usize, usize)) -> bool {
@@ -1065,6 +1074,10 @@ impl OverwritePredictor {
         self.cells
             .iter()
             .all(|cell| cell.line < lines && cell.column < columns)
+            && self
+                .editable_cells
+                .iter()
+                .all(|cell| cell.line < lines && cell.column < columns)
     }
 
     fn overlay(&self, frame: &WireFrame) -> PredictionOverlay {
@@ -1096,6 +1109,7 @@ impl OverwritePredictor {
 
     fn clear(&mut self) {
         self.cells.clear();
+        self.editable_cells.clear();
         self.cursor = None;
         self.suspended_cursor = None;
         self.suspended_at = None;
@@ -1164,11 +1178,80 @@ impl OverwritePredictor {
             minimum = minimum.min(predicted.line);
             maximum = maximum.max(predicted.line);
         }
+        for editable in &self.editable_cells {
+            minimum = minimum.min(editable.line);
+            maximum = maximum.max(editable.line);
+        }
         if let Some((cursor_line, _)) = self.cursor {
             minimum = minimum.min(cursor_line);
             maximum = maximum.max(cursor_line);
         }
         (minimum..=maximum).contains(&line)
+    }
+
+    fn apply_backspace(&mut self, sequence: u64, frame: &WireFrame, region: PredictionRegion) {
+        let now = Instant::now();
+        let cursor = self.cursor.unwrap_or((
+            usize::from(frame.cursor_line),
+            usize::from(frame.cursor_column),
+        ));
+        let Some(target) = retreat_cell(cursor, region) else {
+            return;
+        };
+        if let Some(cell) = self
+            .cells
+            .iter_mut()
+            .find(|cell| (cell.line, cell.column) == target)
+        {
+            cell.byte = b' ';
+            cell.edit = CellEdit::Erase;
+            cell.sequence = sequence;
+            cell.predicted_at = now;
+        } else {
+            let locally_typed = self.editable_cells.iter().any(|cell| {
+                (cell.line, cell.column) == target
+                    && frame.character(cell.line, cell.column) == Some(char::from(cell.byte))
+            });
+            if !locally_typed || self.cells.len() >= frame.cells.len() {
+                // Never infer that arbitrary authoritative text is editable.
+                // Only a cell originating from a confirmed local keystroke can
+                // be erased without waiting for the remote line editor.
+                return;
+            }
+            self.cells.push(ConditionalCell {
+                line: target.0,
+                column: target.1,
+                byte: b' ',
+                edit: CellEdit::Erase,
+                sequence,
+                predicted_at: now,
+            });
+        }
+        self.set_conditional_cursor(target, sequence, now);
+    }
+
+    fn confirm_edit(&mut self, confirmed: ConditionalCell) {
+        let position = (confirmed.line, confirmed.column);
+        match confirmed.edit {
+            CellEdit::Write => {
+                if let Some(editable) = self
+                    .editable_cells
+                    .iter_mut()
+                    .find(|cell| (cell.line, cell.column) == position)
+                {
+                    editable.byte = confirmed.byte;
+                } else {
+                    self.editable_cells.push(EditableCell {
+                        line: confirmed.line,
+                        column: confirmed.column,
+                        byte: confirmed.byte,
+                    });
+                }
+            }
+            CellEdit::Erase => self
+                .editable_cells
+                .retain(|cell| (cell.line, cell.column) != position),
+        }
     }
 
     fn apply_print(
@@ -1207,6 +1290,7 @@ impl OverwritePredictor {
             .find(|cell| (cell.line, cell.column) == cursor)
         {
             cell.byte = byte;
+            cell.edit = CellEdit::Write;
             cell.sequence = sequence;
             cell.predicted_at = now;
         } else if self.cells.len() < frame.cells.len() {
@@ -1214,6 +1298,7 @@ impl OverwritePredictor {
                 line: cursor.0,
                 column: cursor.1,
                 byte,
+                edit: CellEdit::Write,
                 sequence,
                 predicted_at: now,
             });
@@ -1608,6 +1693,7 @@ mod tests {
         predictor.reconcile(&confirmed);
         assert!(predictor.overlay(&confirmed).cells.is_empty());
         assert_eq!(predictor.overlay(&confirmed).cursor, None);
+        assert_eq!(predictor.editable_cells.len(), 2);
     }
 
     #[test]
@@ -1802,6 +1888,98 @@ mod tests {
         assert_eq!(overlay.cells.len(), 1);
         assert_eq!(overlay.cells[0].byte, b' ');
         assert_eq!(overlay.cursor, Some((0, 6)));
+    }
+
+    #[test]
+    fn confirmed_local_text_remains_immediately_backspace_editable() {
+        let base = frame("prompt", 6, 0);
+        let mut predictor = OverwritePredictor::default();
+        predictor.apply(InputAction::Print(b'x'), 1, &base);
+
+        let confirmed = frame("promptx", 7, 1);
+        predictor.reconcile(&confirmed);
+        predictor.apply(InputAction::Backspace, 2, &confirmed);
+
+        let overlay = predictor.overlay(&confirmed);
+        assert_eq!(
+            overlay
+                .cells
+                .iter()
+                .map(|cell| (cell.line, cell.column, cell.byte))
+                .collect::<Vec<_>>(),
+            vec![(0, 6, b' ')]
+        );
+        assert_eq!(overlay.cursor, Some((0, 6)));
+    }
+
+    #[test]
+    fn held_backspace_erases_confirmed_local_text_without_network_round_trips() {
+        let base = frame("prompt", 6, 0);
+        let mut predictor = OverwritePredictor::default();
+        predictor.apply(InputAction::Print(b'a'), 1, &base);
+        predictor.apply(InputAction::Print(b'b'), 2, &base);
+        predictor.apply(InputAction::Print(b'c'), 3, &base);
+
+        let confirmed = frame("promptabc", 9, 3);
+        predictor.reconcile(&confirmed);
+        predictor.apply(InputAction::Backspace, 4, &confirmed);
+        predictor.apply(InputAction::Backspace, 5, &confirmed);
+        predictor.apply(InputAction::Backspace, 6, &confirmed);
+
+        let overlay = predictor.overlay(&confirmed);
+        assert_eq!(
+            overlay
+                .cells
+                .iter()
+                .map(|cell| (cell.line, cell.column, cell.byte))
+                .collect::<Vec<_>>(),
+            vec![(0, 8, b' '), (0, 7, b' '), (0, 6, b' ')]
+        );
+        assert_eq!(overlay.cursor, Some((0, 6)));
+
+        predictor.apply(InputAction::Backspace, 7, &confirmed);
+        assert_eq!(predictor.overlay(&confirmed).cells.len(), 3);
+        assert_eq!(predictor.overlay(&confirmed).cursor, Some((0, 6)));
+    }
+
+    #[test]
+    fn typing_after_backspace_reuses_the_predicted_cell_immediately() {
+        let base = frame("prompt", 6, 0);
+        let mut predictor = OverwritePredictor::default();
+        predictor.apply(InputAction::Print(b'x'), 1, &base);
+
+        let confirmed = frame("promptx", 7, 1);
+        predictor.reconcile(&confirmed);
+        predictor.apply(InputAction::Backspace, 2, &confirmed);
+        predictor.apply(InputAction::Print(b'y'), 3, &confirmed);
+
+        let overlay = predictor.overlay(&confirmed);
+        assert_eq!(
+            overlay
+                .cells
+                .iter()
+                .map(|cell| (cell.line, cell.column, cell.byte))
+                .collect::<Vec<_>>(),
+            vec![(0, 6, b'y')]
+        );
+        assert_eq!(overlay.cursor, Some((0, 7)));
+    }
+
+    #[test]
+    fn authoritative_rewrite_revokes_local_backspace_editability() {
+        let base = frame("prompt", 6, 0);
+        let mut predictor = OverwritePredictor::default();
+        predictor.apply(InputAction::Print(b'x'), 1, &base);
+
+        let confirmed = frame("promptx", 7, 1);
+        predictor.reconcile(&confirmed);
+        let rewritten = frame("prompt!", 7, 1);
+        predictor.reconcile(&rewritten);
+        predictor.apply(InputAction::Backspace, 2, &rewritten);
+
+        let overlay = predictor.overlay(&rewritten);
+        assert!(overlay.cells.is_empty());
+        assert_eq!(overlay.cursor, None);
     }
 
     #[test]

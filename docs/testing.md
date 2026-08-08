@@ -48,7 +48,9 @@ Prediction tests require these invariants:
 - a contradictory cell rolls back only after the authoritative cursor catches
   up and the contradiction remains stable for the settlement interval;
 - matching authoritative cells consume the prediction without a visible erase;
-- backspace conditionally overwrites only the erased cell with a blank;
+- backspace conditionally overwrites only locally typed cells with blanks, even
+  after remote confirmation or during key repeat, and never erases prompt or
+  application-owned cells;
 - transport receipt does not expire a cell before delayed echo validation;
 - simple left/right movement is conditional, while bracketed paste, release
   events, and unsupported input are not predicted;

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep remotely confirmed local typing eligible for immediate overwrite-only
+  backspace prediction, including held backspace and delete-then-retype bursts,
+  without treating prompt or application-owned cells as editable.
+
 ## [0.1.1] - 2026-08-08
 
 ### Added
