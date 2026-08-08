@@ -15,9 +15,14 @@ Crush supports macOS and Linux on x86-64 and ARM64:
 curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | sh
 ```
 
-Open a new terminal if the installer adds `~/.local/bin` to `PATH`, then
-connect. The first connection installs the matching helper on the remote host
-through SSH:
+On Windows, install through WSL from PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm 'https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.ps1')))
+```
+
+Open a new terminal after either installer updates `PATH`, then connect. The
+first connection installs the matching helper on the remote host through SSH:
 
 ```sh
 crush user@example.com

@@ -221,6 +221,7 @@ jobs:
         run: |
           set -euo pipefail
           for asset in \
+            dist/crush-installer.ps1 \
             dist/crush-installer.sh \
             dist/*.tar.gz \
             dist/SHA256SUMS \

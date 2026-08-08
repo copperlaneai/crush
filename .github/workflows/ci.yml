@@ -212,4 +212,41 @@ jobs:
           done
           scripts/prepare-release-assets.sh 0.1.0 "$assets"
           test -x "$assets/crush-installer.sh"
-          test "$(wc -l <"$assets/SHA256SUMS")" -eq 7
+          test -f "$assets/crush-installer.ps1"
+          test "$(wc -l <"$assets/SHA256SUMS")" -eq 8
+
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Parse installer
+        shell: pwsh
+        run: |
+          foreach ($path in @('install.ps1', 'scripts/test-windows-installer.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void] [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref] $tokens,
+              [ref] $errors
+            )
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error $_ }
+              exit 1
+            }
+          }
+
+      - name: Exercise install and collision handling
+        shell: pwsh
+        run: |
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File scripts/test-windows-installer.ps1
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }

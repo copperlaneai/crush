@@ -32,7 +32,13 @@ and escape semantics on SSH paths.
 | --- | --- | --- |
 | Linux | x86-64, ARM64 | Supported target |
 | macOS 11+ | x86-64, Apple Silicon | Supported target |
-| Windows/ConPTY | — | Deferred |
+| Windows 10/11 with WSL | x86-64, ARM64 | Supported through WSL launcher |
+| Windows/ConPTY | — | Native support deferred |
+
+The Windows launcher executes Crush and OpenSSH inside its selected WSL
+distribution. SSH configuration, key paths, agents, and other local resources
+therefore come from that Linux environment rather than the Windows OpenSSH
+installation.
 
 The source-build MSRV is Rust 1.85. Crush checks the default helper version and
 installs or upgrades it to match the client before starting a mobile session.

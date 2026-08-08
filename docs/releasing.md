@@ -33,8 +33,8 @@ moves the tag. A manual re-run must be dispatched with that tag selected as the
 workflow ref so the Sigstore identity remains bound to `refs/tags/VERSION`.
 
 `scripts/prepare-release-assets.sh` validates the complete target set, copies
-the stable installer asset, and creates the checksum manifest used by the
-release workflow.
+the stable POSIX and Windows installer assets, and creates the checksum
+manifest used by the release workflow.
 
 ## Release assets
 
@@ -48,17 +48,22 @@ Each version publishes:
   - `x86_64-apple-darwin`
   - `aarch64-apple-darwin`
 - `SHA256SUMS`
+- `crush-installer.ps1`
 - `crush-installer.sh`
 - `crush-VERSION.spdx.json`
 - one `.sigstore.json` bundle beside the installer, every archive, checksum
   manifest, and SBOM.
 
-Every archive contains `crush`, `README.md`, and `LICENSE` at its root.
-`crush-installer.sh` has a stable asset name so the latest release is
-installable with one command:
+Every archive contains `crush`, `README.md`, and `LICENSE` at its root. Both
+installers have stable asset names so the latest release is installable with one
+command:
 
 ```sh
 curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | sh
+```
+
+```powershell
+& ([scriptblock]::Create((irm 'https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.ps1')))
 ```
 
 On Linux, `install.sh` always selects the static musl archive. GNU target

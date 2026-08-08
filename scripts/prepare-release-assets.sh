@@ -54,13 +54,17 @@ done
 
 install -m 0755 "${repository_root}/install.sh" \
     "${distribution_directory}/crush-installer.sh"
+install -m 0644 "${repository_root}/install.ps1" \
+    "${distribution_directory}/crush-installer.ps1"
 
 (
     cd "$distribution_directory"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -- crush-installer.sh crush-"${version}"-*.tar.gz >SHA256SUMS
+        sha256sum -- crush-installer.ps1 crush-installer.sh \
+            crush-"${version}"-*.tar.gz >SHA256SUMS
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 crush-installer.sh crush-"${version}"-*.tar.gz >SHA256SUMS
+        shasum -a 256 crush-installer.ps1 crush-installer.sh \
+            crush-"${version}"-*.tar.gz >SHA256SUMS
     else
         printf 'prepare-release-assets: neither sha256sum nor shasum is available\n' >&2
         exit 1
