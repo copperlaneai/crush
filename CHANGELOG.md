@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-08
+
+### Added
+
+- Add a PowerShell installer for Windows that installs Crush into a selected
+  WSL distribution, creates Windows command launchers, updates the user PATH,
+  and ships as a checksummed, signed release asset.
+
+### Changed
+
+- Distribute Crush under the MIT License and include a single `LICENSE` file in
+  source and release archives.
+
 ### Fixed
 
+- Prevent backspace prediction from erasing authoritative prompt cells when no
+  local predicted suffix is pending.
 - Pause speculative input at physical row boundaries until the remote screen
   publishes its continuation anchor, preventing transient duplicated input rows
   when coding-agent widgets reflow inside tmux.
@@ -99,5 +114,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zeroized 64 KiB TUI frame buffers so continuous agent redraws do not allocate
   a fresh coalescing buffer for every physical paint.
 
-[Unreleased]: https://github.com/copperlaneai/crush/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/copperlaneai/crush/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/copperlaneai/crush/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/copperlaneai/crush/releases/tag/v0.1.0
