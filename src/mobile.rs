@@ -869,23 +869,19 @@ impl OverwritePredictor {
                 let Some(target) = retreat_cell(cursor, region) else {
                     return;
                 };
-                if let Some(cell) = self
+                let Some(cell) = self
                     .cells
                     .iter_mut()
                     .find(|cell| (cell.line, cell.column) == target)
-                {
-                    cell.byte = b' ';
-                    cell.sequence = sequence;
-                    cell.predicted_at = now;
-                } else if self.cells.len() < frame.cells.len() {
-                    self.cells.push(ConditionalCell {
-                        line: target.0,
-                        column: target.1,
-                        byte: b' ',
-                        sequence,
-                        predicted_at: now,
-                    });
-                }
+                else {
+                    // Without a pending local cell, the target belongs to the
+                    // authoritative screen and may be part of the prompt. Let
+                    // the remote line editor decide whether it is erasable.
+                    return;
+                };
+                cell.byte = b' ';
+                cell.sequence = sequence;
+                cell.predicted_at = now;
                 self.set_conditional_cursor(target, sequence, now);
             }
             InputAction::MoveLeft => {
@@ -1744,6 +1740,17 @@ mod tests {
         assert_eq!(overlay.cells.len(), 1);
         assert_eq!(overlay.cells[0].byte, b' ');
         assert_eq!(overlay.cursor, Some((0, 6)));
+    }
+
+    #[test]
+    fn backspace_without_a_local_suffix_never_erases_the_remote_prompt() {
+        let base = frame("user@host$ ", 11, 0);
+        let mut predictor = OverwritePredictor::default();
+        predictor.apply(InputAction::Backspace, 1, &base);
+
+        let overlay = predictor.overlay(&base);
+        assert!(overlay.cells.is_empty());
+        assert_eq!(overlay.cursor, None);
     }
 
     #[test]
