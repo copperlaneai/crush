@@ -195,7 +195,7 @@ jobs:
           archive=target/package-smoke/dist/crush-0.1.0-x86_64-unknown-linux-gnu.tar.gz
           test -f "$archive"
           test "$(tar -tzf "$archive" | LC_ALL=C sort)" = "$(printf '%s\n' \
-            LICENSE-APACHE LICENSE-MIT README.md crush | LC_ALL=C sort)"
+            LICENSE README.md crush | LC_ALL=C sort)"
 
       - name: Exercise release asset preparation
         run: |

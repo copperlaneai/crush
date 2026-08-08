@@ -215,7 +215,7 @@ if awk '
     fail "${asset} contains an unsafe path"
 fi
 
-for required_entry in crush README.md LICENSE-MIT LICENSE-APACHE; do
+for required_entry in crush README.md LICENSE; do
     if ! awk -v required="$required_entry" '$0 == required { found = 1 } END { exit found ? 0 : 1 }' \
         "$archive_list"; then
         fail "${asset} is missing ${required_entry}"
@@ -223,7 +223,7 @@ for required_entry in crush README.md LICENSE-MIT LICENSE-APACHE; do
 done
 
 if awk '
-    $0 != "crush" && $0 != "README.md" && $0 != "LICENSE-MIT" && $0 != "LICENSE-APACHE" {
+    $0 != "crush" && $0 != "README.md" && $0 != "LICENSE" {
         unexpected = 1
     }
     END { exit unexpected ? 0 : 1 }

@@ -76,5 +76,4 @@ See [Contributing](CONTRIBUTING.md), [Architecture](docs/architecture.md),
 
 ## License
 
-Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your
-option.
+Licensed under the [MIT License](LICENSE).

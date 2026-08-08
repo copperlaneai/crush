@@ -59,13 +59,12 @@ trap cleanup EXIT HUP INT TERM
 
 install -m 0755 "$binary" "${staging_directory}/crush"
 install -m 0644 "${repository_root}/README.md" "${staging_directory}/README.md"
-install -m 0644 "${repository_root}/LICENSE-MIT" "${staging_directory}/LICENSE-MIT"
-install -m 0644 "${repository_root}/LICENSE-APACHE" "${staging_directory}/LICENSE-APACHE"
+install -m 0644 "${repository_root}/LICENSE" "${staging_directory}/LICENSE"
 
 archive="${output_directory}/crush-${version}-${target}.tar.gz"
 (
     cd "$staging_directory"
-    COPYFILE_DISABLE=1 tar -czf "$archive" crush README.md LICENSE-MIT LICENSE-APACHE
+    COPYFILE_DISABLE=1 tar -czf "$archive" crush README.md LICENSE
 )
 
 printf '%s\n' "$archive"

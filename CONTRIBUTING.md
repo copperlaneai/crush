@@ -91,5 +91,5 @@ without measurement showing that the copy matters.
 ## Licensing contributions
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in Crush is licensed under either Apache-2.0 or MIT, at the user's
-option, without additional terms or conditions.
+for inclusion in Crush is licensed under the MIT License, without additional
+terms or conditions.

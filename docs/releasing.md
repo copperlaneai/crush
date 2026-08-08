@@ -53,9 +53,9 @@ Each version publishes:
 - one `.sigstore.json` bundle beside the installer, every archive, checksum
   manifest, and SBOM.
 
-Every archive contains `crush`, `README.md`, `LICENSE-MIT`, and
-`LICENSE-APACHE` at its root. `crush-installer.sh` has a stable asset name so
-the latest release is installable with one command:
+Every archive contains `crush`, `README.md`, and `LICENSE` at its root.
+`crush-installer.sh` has a stable asset name so the latest release is
+installable with one command:
 
 ```sh
 curl -fsSL https://github.com/copperlaneai/crush/releases/latest/download/crush-installer.sh | sh
