@@ -22,7 +22,7 @@ base64 = "0.22.1"
 chacha20poly1305 = "0.10.1"
 getrandom = "0.3.4"
 libc = "0.2.177"
-lz4_flex = { version = "0.11.5", default-features = false, features = ["std"] }
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std"] }
 rustix-openpty = "=0.2.0"
 signal-hook = "0.4.3"
 zeroize = "1.8.2"
